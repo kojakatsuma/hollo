@@ -82,7 +82,6 @@ const app = new Hono<{ Variables: AccountOwnerVariables }>();
 const logger = getLogger(["hollo", "api", "v1", "statuses"]);
 
 class MediaClaimError extends Error {}
-class StatusNotFoundError extends Error {}
 
 const quoteApprovalPolicySchema = z.enum(["public", "followers", "nobody"]);
 
@@ -348,8 +347,6 @@ const statusSchemaBase = z.object({
   language: z.string().min(2).optional().nullable(),
   quote_approval_policy: quoteApprovalPolicySchema.optional().nullable(),
 });
-
-const statusSchema = z.preprocess(normalizeStatusParams, statusSchemaBase);
 
 const createStatusSchema = z.preprocess(
   normalizeStatusParams,
@@ -650,204 +647,16 @@ app.post(
   },
 );
 
+// Editing statuses is disabled on this instance: an edit would only be shown
+// as a separate reply on Hollo instances, while other servers would overwrite
+// the original post, so the original content could silently disappear.
 app.put(
   "/:id",
   tokenRequired,
   scopeRequired(["write:statuses"]),
   withAccountOwner,
-  async (c) => {
-    const owner = c.get("accountOwner");
-
-    const id = c.req.param("id");
-    if (!isUuid(id)) {
-      return c.json({ error: "Record not found" }, 404);
-    }
-
-    const result = await requestBody(c.req, statusSchema);
-
-    if (!result.success) {
-      logger.debug("Invalid request: {error}", { error: result.error.issues });
-      return c.json({ error: "invalid_request", zod_error: result.error }, 422);
-    }
-
-    const data = result.data;
-
-    const fedCtx = federation.createContext(c.req.raw, undefined);
-    const fmtOpts = {
-      url: fedCtx.url,
-      contextLoader: fedCtx.contextLoader,
-      documentLoader: await fedCtx.getDocumentLoader({
-        username: owner.handle,
-      }),
-    };
-    const { formatPostContent } = await import("../../text");
-    const content =
-      data.status == null
-        ? null
-        : await formatPostContent(db, data.status, data.language, fmtOpts);
-    const summary =
-      data.spoiler_text == null || data.spoiler_text.trim() === ""
-        ? null
-        : data.spoiler_text;
-    const hashtags = content?.hashtags ?? [];
-    const tags = Object.fromEntries(
-      hashtags.map((tag) => [
-        tag.toLowerCase(),
-        new URL(`/tags/${encodeURIComponent(tag.substring(1))}`, c.req.url)
-          .href,
-      ]),
-    );
-    const emojis = content?.emojis ?? {};
-    let previewCard: PreviewCard | null = null;
-    if (content?.previewLink != null) {
-      previewCard = await fetchPreviewCard(content.previewLink);
-    }
-    const existingPost = await db.query.posts.findFirst({
-      where: { id: { eq: id }, accountId: { eq: owner.id } },
-    });
-    if (existingPost == null) {
-      return c.json({ error: "Record not found" }, 404);
-    }
-    const mediaIds = data.media_ids;
-    const mediaIdSet = mediaIds == null ? null : new Set(mediaIds);
-    if (mediaIds != null) {
-      if (mediaIdSet!.size !== mediaIds.length) {
-        return c.json({ error: "Media not found" }, 422);
-      }
-      for (const mediumId of mediaIds) {
-        const existingMedium = await db.query.media.findFirst({
-          where: {
-            id: { eq: mediumId },
-            OR: [{ postId: { isNull: true } }, { postId: { eq: id } }],
-          },
-        });
-        if (existingMedium == null) {
-          return c.json({ error: "Media not found" }, 422);
-        }
-      }
-    }
-    const mediaAttributes =
-      data.media_attributes?.filter((attr) => attr.description !== undefined) ??
-      [];
-    for (const attr of mediaAttributes) {
-      if (mediaIdSet != null && !mediaIdSet.has(attr.id)) {
-        return c.json({ error: "Media not found" }, 422);
-      }
-      const existingMedium = await db.query.media.findFirst({
-        where:
-          mediaIdSet == null
-            ? { id: { eq: attr.id }, postId: { eq: id } }
-            : {
-                id: { eq: attr.id },
-                OR: [{ postId: { isNull: true } }, { postId: { eq: id } }],
-              },
-      });
-      if (existingMedium == null) {
-        return c.json({ error: "Media not found" }, 422);
-      }
-    }
-    const quoteApprovalPolicy = normalizeQuoteApprovalPolicy(
-      data.quote_approval_policy ?? existingPost.quoteApprovalPolicy,
-    );
-    try {
-      await db.transaction(async (tx) => {
-        const result = await tx
-          .update(posts)
-          .set({
-            content: data.status,
-            contentHtml: content?.html,
-            sensitive: data.sensitive,
-            summary,
-            language: data.language ?? owner.language,
-            tags,
-            emojis,
-            previewCard,
-            quoteApprovalPolicy,
-            updated: new Date(),
-          })
-          .where(and(eq(posts.id, id), eq(posts.accountId, owner.id)))
-          .returning();
-        if (result.length < 1) {
-          throw new StatusNotFoundError();
-        }
-        await tx.delete(mentions).where(eq(mentions.postId, id));
-        const mentionedIds = content?.mentions ?? [];
-        if (mentionedIds.length > 0) {
-          await tx.insert(mentions).values(
-            mentionedIds.map((accountId) => ({
-              postId: id,
-              accountId,
-            })),
-          );
-        }
-        if (mediaIds != null) {
-          await tx
-            .update(media)
-            .set({ postId: null, position: 0 })
-            .where(
-              mediaIds.length < 1
-                ? eq(media.postId, id)
-                : and(eq(media.postId, id), notInArray(media.id, mediaIds)),
-            );
-          for (const [position, mediumId] of mediaIds.entries()) {
-            const claimedMedia = await tx
-              .update(media)
-              .set({ postId: id, position })
-              .where(
-                and(
-                  eq(media.id, mediumId),
-                  or(isNull(media.postId), eq(media.postId, id)),
-                ),
-              )
-              .returning();
-            if (claimedMedia.length < 1) throw new MediaClaimError();
-          }
-        }
-        for (const attr of mediaAttributes) {
-          const updatedMedia = await tx
-            .update(media)
-            .set({ description: attr.description })
-            .where(and(eq(media.id, attr.id), eq(media.postId, id)))
-            .returning();
-          if (updatedMedia.length < 1) throw new MediaClaimError();
-        }
-      });
-    } catch (error) {
-      if (error instanceof MediaClaimError) {
-        return c.json({ error: "Media not found" }, 422);
-      }
-      if (error instanceof StatusNotFoundError) {
-        return c.json({ error: "Record not found" }, 404);
-      }
-      throw error;
-    }
-    const post = await db.query.posts.findFirst({
-      where: { id: { eq: id } },
-      with: getPostRelations(owner.id),
-    });
-    const activity = toUpdate(post!, fedCtx);
-    const orderingKey = getPostOrderingKey(post!.iri);
-    await fedCtx.sendActivity(
-      { username: owner.handle },
-      getRecipients(post!),
-      activity,
-      {
-        orderingKey,
-        excludeBaseUris: [new URL(c.req.url)],
-      },
-    );
-    await fedCtx.sendActivity(
-      { username: owner.handle },
-      "followers",
-      activity,
-      {
-        orderingKey,
-        preferSharedInbox: true,
-        excludeBaseUris: [new URL(c.req.url)],
-      },
-    );
-    return c.json(serializePost(post!, owner, c.req.url));
-  },
+  (c) =>
+    c.json({ error: "Editing statuses is disabled on this instance." }, 403),
 );
 
 const interactionPolicySchema = z.object({
