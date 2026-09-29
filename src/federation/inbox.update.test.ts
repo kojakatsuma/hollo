@@ -1,12 +1,13 @@
 import type { InboxContext } from "@fedify/fedify";
-import { Note, Person, PUBLIC_COLLECTION, Update } from "@fedify/vocab";
+import { Delete, Note, Person, PUBLIC_COLLECTION, Update } from "@fedify/vocab";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { cleanDatabase } from "../../tests/helpers";
 import db from "../db";
 import { accounts, instances, posts } from "../schema";
 import type { Uuid } from "../uuid";
-import { onPostUpdated } from "./inbox";
+import { toTemporalInstant } from "./date";
+import { onPostDeleted, onPostUpdated } from "./inbox";
 
 const ctx = {
   origin: "https://hollo.test",
@@ -151,5 +152,93 @@ describe("onPostUpdated", () => {
       where: { iri: { eq: forgedIri } },
     });
     expect(after).toBeUndefined();
+  });
+
+  it("stores an edit as a reply instead of overwriting the original", async () => {
+    expect.assertions(6);
+    const author = await seedRemoteAccount("remote.test", "author");
+    const post = await seedRemotePost(author.id, author.iri, "original");
+    const editedAt = toTemporalInstant(new Date("2026-01-01T00:00:00Z"));
+
+    const update = new Update({
+      id: new URL(`${post.iri}#updates/1`),
+      actor: new URL(author.iri),
+      object: new Note({
+        id: new URL(post.iri),
+        attribution: new Person({
+          id: new URL(author.iri),
+          preferredUsername: "author",
+          inbox: new URL(`${author.iri}/inbox`),
+        }),
+        content: "edited",
+        to: PUBLIC_COLLECTION,
+        updated: editedAt,
+      }),
+    });
+
+    await onPostUpdated(ctx, update);
+    // Redelivery of the same edit must not create a duplicate:
+    await onPostUpdated(ctx, update);
+
+    const original = await db.query.posts.findFirst({
+      where: { iri: { eq: post.iri } },
+    });
+    expect(original?.contentHtml).toBe("<p>original</p>");
+
+    const edits = await db.query.posts.findMany({
+      where: { replyTargetId: { eq: post.id } },
+    });
+    expect(edits).toHaveLength(1);
+    expect(edits[0].iri).toBe(
+      `${post.iri}#hollo-edit-${editedAt.epochMilliseconds}`,
+    );
+    expect(edits[0].contentHtml).toBe("edited");
+    expect(edits[0].accountId).toBe(author.id);
+    expect(edits[0].visibility).toBe("public");
+  });
+
+  it("deletes stored edits together with the original post", async () => {
+    expect.assertions(2);
+    const author = await seedRemoteAccount("remote.test", "author");
+    const post = await seedRemotePost(author.id, author.iri, "original");
+
+    await onPostUpdated(
+      ctx,
+      new Update({
+        id: new URL(`${post.iri}#updates/1`),
+        actor: new URL(author.iri),
+        object: new Note({
+          id: new URL(post.iri),
+          attribution: new Person({
+            id: new URL(author.iri),
+            preferredUsername: "author",
+            inbox: new URL(`${author.iri}/inbox`),
+          }),
+          content: "edited",
+          to: PUBLIC_COLLECTION,
+          updated: toTemporalInstant(new Date("2026-01-01T00:00:00Z")),
+        }),
+      }),
+    );
+    expect(
+      await db.query.posts.findMany({
+        where: { replyTargetId: { eq: post.id } },
+      }),
+    ).toHaveLength(1);
+
+    await onPostDeleted(
+      ctx,
+      new Delete({
+        id: new URL(`${post.iri}#delete`),
+        actor: new URL(author.iri),
+        object: new URL(post.iri),
+      }),
+    );
+
+    expect(
+      await db.query.posts.findMany({
+        where: { accountId: { eq: author.id } },
+      }),
+    ).toHaveLength(0);
   });
 });

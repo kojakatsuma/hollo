@@ -26,7 +26,7 @@ import {
   type Update,
 } from "@fedify/vocab";
 import { getLogger } from "@logtape/logtape";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 
 import { db } from "../db";
 import {
@@ -65,6 +65,7 @@ import {
   updateAccountStats,
 } from "./account";
 import {
+  type ASPost,
   getRecipients,
   isPost,
   persistPollVote,
@@ -1050,6 +1051,21 @@ export async function onPostUpdated(
     where: { iri: { eq: objectId.href } },
   });
 
+  // An edit of an already cached post is not applied in place; instead, the
+  // edited version is stored as a separate post replying to the original so
+  // that the original content stays visible.  Updates that do not carry a new
+  // `updated` timestamp (e.g., Mastodon's poll tally updates) are still
+  // applied in place.
+  const updated = object.updated;
+  if (
+    existingPost != null &&
+    updated != null &&
+    updated.epochMilliseconds !== existingPost.updated.getTime()
+  ) {
+    await persistEditAsReply(ctx, object, existingPost);
+    return;
+  }
+
   // Persist the updated post; null means the post was rejected (e.g. future timestamp)
   const updatedPost = await persistPost(
     db,
@@ -1081,6 +1097,51 @@ export async function onPostUpdated(
   }
 }
 
+const EDIT_IRI_MARKER = "hollo-edit-";
+
+function isEditIri(iri: string, originalIri: string): boolean {
+  const original = new URL(originalIri);
+  const url = new URL(iri);
+  const hash = url.hash.slice(1);
+  const prefix = original.hash === "" ? "" : `${original.hash.slice(1)}-`;
+  url.hash = original.hash;
+  return (
+    url.href === original.href &&
+    /^\d+$/.test(hash.slice(prefix.length + EDIT_IRI_MARKER.length)) &&
+    hash.startsWith(`${prefix}${EDIT_IRI_MARKER}`)
+  );
+}
+
+/**
+ * Stores an edited version of a remote post as a new post replying to the
+ * original one, instead of overwriting the original.  The IRI of the new post
+ * is derived from the original IRI and the edit's `updated` timestamp, so that
+ * redelivered `Update` activities for the same edit do not produce duplicates.
+ */
+async function persistEditAsReply(
+  ctx: InboxContext<void>,
+  object: ASPost,
+  original: Post,
+): Promise<void> {
+  if (object.id == null || object.updated == null) return;
+  const editIri = new URL(object.id.href);
+  const suffix = `${EDIT_IRI_MARKER}${object.updated.epochMilliseconds}`;
+  editIri.hash =
+    object.id.hash === "" ? suffix : `${object.id.hash.slice(1)}-${suffix}`;
+  const editObject = object.clone({
+    id: editIri,
+    replyTarget: object.id,
+    // The collections belong to the original post, not to the edit:
+    replies: null,
+    shares: null,
+    likes: null,
+  });
+  await persistPost(db, editObject, ctx.origin, {
+    ...getPersistOptions(ctx),
+    replyTarget: original,
+  });
+}
+
 export async function onPostDeleted(
   _ctx: InboxContext<void>,
   del: Delete,
@@ -1104,6 +1165,20 @@ export async function onPostDeleted(
         { postIri: objectId.href, actorIri: actorId.href },
       );
       return;
+    }
+    // Edits stored by persistEditAsReply() go away with the original post:
+    const replies = await tx.query.posts.findMany({
+      where: {
+        replyTargetId: { eq: existingPost.id },
+        accountId: { eq: existingPost.accountId },
+      },
+      columns: { id: true, iri: true },
+    });
+    const editIds = replies
+      .filter((reply) => isEditIri(reply.iri, existingPost.iri))
+      .map((reply) => reply.id);
+    if (editIds.length > 0) {
+      await tx.delete(posts).where(inArray(posts.id, editIds));
     }
     const deletedPosts = await tx
       .delete(posts)
