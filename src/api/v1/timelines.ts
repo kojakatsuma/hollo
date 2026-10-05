@@ -162,10 +162,12 @@ async function readTimelineSnapshot<T>(
   });
 }
 
-// Hide the posts (including boosts) from the members of the owner's
-// exclusive lists, which are shown only in their list timelines.  The owner's
-// own posts and the posts mentioning the owner are kept in the home timeline:
-function buildExclusiveListFilterCondition(
+// Hide the posts (including boosts) from the members of any of the owner's
+// lists, which are shown only in their list timelines.  Unlike Mastodon, this
+// does not depend on the list's exclusive flag, since some clients (e.g.,
+// Phanpy) cannot set it on Hollo.  The owner's own posts and the posts
+// mentioning the owner are kept in the home timeline:
+function buildListMemberFilterCondition(
   ownerId: Uuid,
   table = posts,
 ): SQL | undefined {
@@ -184,9 +186,7 @@ function buildExclusiveListFilterCondition(
         .select({ accountId: listMembers.accountId })
         .from(listMembers)
         .innerJoin(lists, eq(listMembers.listId, lists.id))
-        .where(
-          and(eq(lists.accountOwnerId, ownerId), eq(lists.exclusive, true)),
-        ),
+        .where(eq(lists.accountOwnerId, ownerId)),
     ),
   );
 }
@@ -449,7 +449,7 @@ app.get(
                 ? undefined
                 : gt(timelinePosts.postId, lowerBound),
               ...getTimelinePostFilterConditions(owner.id),
-              buildExclusiveListFilterCondition(owner.id),
+              buildListMemberFilterCondition(owner.id),
             ),
           )
           .orderBy(
@@ -526,7 +526,7 @@ app.get(
                       ),
                   ),
                 ),
-                buildExclusiveListFilterCondition(owner.id, posts),
+                buildListMemberFilterCondition(owner.id, posts),
                 // Hide future posts
                 lte(posts.published, sql`NOW() + INTERVAL '5 minutes'`),
                 // Hide the posts from the muted accounts:

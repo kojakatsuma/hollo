@@ -708,7 +708,7 @@ describe.sequential("/api/v1/timelines/home", () => {
   });
 });
 
-describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
+describe.sequential("/api/v1/timelines/home (list members)", () => {
   let owner: Awaited<ReturnType<typeof createAccount>>;
   let member: Awaited<ReturnType<typeof createAccount>>;
   let other: Awaited<ReturnType<typeof createAccount>>;
@@ -719,9 +719,9 @@ describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
   beforeEach(async () => {
     await cleanDatabase();
 
-    owner = await createAccount({ username: "exclusive-owner" });
-    member = await createAccount({ username: "exclusive-member" });
-    other = await createAccount({ username: "exclusive-other" });
+    owner = await createAccount({ username: "list-owner" });
+    member = await createAccount({ username: "list-member" });
+    other = await createAccount({ username: "list-other" });
     client = await createOAuthApplication({
       scopes: ["read:statuses", "read:lists"],
     });
@@ -743,9 +743,9 @@ describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
     await db.insert(lists).values({
       id: listId,
       accountOwnerId: owner.id,
-      title: "Exclusive list",
+      title: "List",
       repliesPolicy: "list",
-      exclusive: true,
+      exclusive: false,
     });
     await db.insert(listMembers).values({ listId, accountId: member.id });
   });
@@ -779,7 +779,7 @@ describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
     return json.map((status) => status.id);
   }
 
-  it("hides posts and boosts from exclusive list members", async () => {
+  it("hides posts and boosts from list members", async () => {
     expect.assertions(2);
 
     const otherPostId = await insertPost(other);
@@ -796,7 +796,7 @@ describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
     expect(ids).toEqual([ownPostId, otherPostId]);
   });
 
-  it("keeps posts from exclusive list members that mention the owner", async () => {
+  it("keeps posts from list members that mention the owner", async () => {
     expect.assertions(2);
 
     await insertPost(member);
@@ -810,30 +810,28 @@ describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
     expect(ids).toEqual([mentionPostId]);
   });
 
-  it("does not hide posts from members of non-exclusive lists", async () => {
+  it("hides posts from members of exclusive lists as well", async () => {
     expect.assertions(2);
 
-    await db
-      .update(lists)
-      .set({ exclusive: false })
-      .where(eq(lists.id, listId));
-    const memberPostId = await insertPost(member);
+    await db.update(lists).set({ exclusive: true }).where(eq(lists.id, listId));
+    const otherPostId = await insertPost(other);
+    await insertPost(member);
 
     const ids = await fetchHomeIds();
 
-    expect(ids).toEqual([memberPostId]);
+    expect(ids).toEqual([otherPostId]);
   });
 
-  it("ignores exclusive lists owned by other accounts", async () => {
+  it("ignores lists owned by other accounts", async () => {
     expect.assertions(2);
 
     const otherListId = uuidv7();
     await db.insert(lists).values({
       id: otherListId,
       accountOwnerId: other.id,
-      title: "Another owner's exclusive list",
+      title: "Another owner's list",
       repliesPolicy: "list",
-      exclusive: true,
+      exclusive: false,
     });
     await db
       .insert(listMembers)
@@ -845,7 +843,7 @@ describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
     expect(ids).toEqual([otherPostId]);
   });
 
-  it("still shows the posts in the exclusive list timeline", async () => {
+  it("still shows the posts in the list timeline", async () => {
     expect.assertions(2);
 
     const memberPostId = await insertPost(member);
