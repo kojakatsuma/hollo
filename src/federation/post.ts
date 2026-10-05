@@ -3,6 +3,7 @@ import * as vocab from "@fedify/vocab";
 import {
   type Announce,
   Article,
+  Audio,
   ChatMessage,
   Collection,
   Create,
@@ -35,7 +36,13 @@ import { isSSRFSafeURL } from "ssrfcheck";
 
 import type { DatabaseLike } from "../db";
 import { extractPreviewLink } from "../html";
-import { makeVideoScreenshot, type Thumbnail, uploadThumbnail } from "../media";
+import {
+  getDefaultScreenshot,
+  makeVideoScreenshot,
+  normalizeMediaType,
+  type Thumbnail,
+  uploadThumbnail,
+} from "../media";
 import { orderMedia } from "../media-order";
 import { REMOTE_MEDIA_THUMBNAILS } from "../media-proxy";
 import { fetchPreviewCard } from "../previewcard";
@@ -510,6 +517,7 @@ export async function persistPost(
       !(
         attachment instanceof Image ||
         attachment instanceof Video ||
+        attachment instanceof Audio ||
         attachment instanceof Document
       )
     ) {
@@ -528,11 +536,18 @@ export async function persistPost(
       const response = await fetch(url);
       mediaType = response.headers.get("Content-Type") ?? attachment.mediaType;
       if (mediaType == null) continue;
+      mediaType = normalizeMediaType(mediaType);
       try {
-        const imageData = new Uint8Array(await response.arrayBuffer());
-        let imageBytes: Uint8Array = imageData;
-        if (mediaType.startsWith("video/")) {
-          imageBytes = await makeVideoScreenshot(imageData);
+        let imageBytes: Uint8Array;
+        if (mediaType.startsWith("audio/")) {
+          // Audio has no frame to render; don't download the whole file:
+          await response.body?.cancel().catch(() => {});
+          imageBytes = getDefaultScreenshot();
+        } else {
+          const imageData = new Uint8Array(await response.arrayBuffer());
+          imageBytes = mediaType.startsWith("video/")
+            ? await makeVideoScreenshot(imageData)
+            : imageData;
         }
         const { default: sharp } = await import("sharp");
         const image = sharp(imageBytes);
@@ -592,6 +607,7 @@ export async function persistPost(
         }
       }
       if (mediaType == null) continue;
+      mediaType = normalizeMediaType(mediaType);
       metadata = {
         width: attachment.width ?? 512,
         height: attachment.height ?? 512,
@@ -1060,25 +1076,19 @@ export function toObject(
             id: new URL("#likes", post.iri),
             totalItems: post.likesCount,
           }),
-    attachments: orderMedia(post.media).map((medium) =>
-      medium.type.startsWith("video/")
-        ? new Video({
-            mediaType: medium.type,
-            url: new URL(medium.url),
-            name: medium.description,
-            summary: medium.description,
-            width: medium.width,
-            height: medium.height,
-          })
-        : new Image({
-            mediaType: medium.type,
-            url: new URL(medium.url),
-            name: medium.description,
-            summary: medium.description,
-            width: medium.width,
-            height: medium.height,
-          }),
-    ),
+    attachments: orderMedia(post.media).map((medium) => {
+      const values = {
+        mediaType: medium.type,
+        url: new URL(medium.url),
+        name: medium.description,
+        summary: medium.description,
+      };
+      if (medium.type.startsWith("audio/")) return new Audio(values);
+      const dimensions = { width: medium.width, height: medium.height };
+      return medium.type.startsWith("video/")
+        ? new Video({ ...values, ...dimensions })
+        : new Image({ ...values, ...dimensions });
+    }),
     quote: quoteTargetIri == null ? null : new URL(quoteTargetIri),
     quoteUrl: quoteTargetIri == null ? null : new URL(quoteTargetIri),
     quoteAuthorization:

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { getLogger } from "@logtape/logtape";
+import mime from "mime";
 import type { Sharp } from "sharp";
 
 const logger = getLogger(["hollo", "media"]);
@@ -12,6 +13,89 @@ const DEFAULT_THUMBNAIL_AREA = 230_400;
 const defaultScreenshot = readFileSync(
   join(import.meta.dirname, "..", "assets", "default-screenshot.png"),
 );
+
+/**
+ * The default screenshot image, used as the thumbnail for media that have
+ * no visual frame of their own (audio) or whose frame could not be extracted.
+ */
+export function getDefaultScreenshot(): Uint8Array {
+  return defaultScreenshot;
+}
+
+/**
+ * MIME types accepted for media uploads, as advertised by the instance API.
+ */
+export const SUPPORTED_MEDIA_TYPES: readonly string[] = [
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "video/mp4",
+  "video/webm",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/mp4",
+  "audio/m4a",
+  "audio/x-m4a",
+  "audio/aac",
+  "audio/ogg",
+  "audio/vorbis",
+  "audio/opus",
+  "audio/wav",
+  "audio/wave",
+  "audio/x-wav",
+  "audio/flac",
+  "audio/x-flac",
+  "audio/webm",
+];
+
+const AUDIO_MIME_TYPE_ALIASES: Record<string, string> = {
+  "audio/mp3": "audio/mpeg",
+  "audio/mpeg3": "audio/mpeg",
+  "audio/x-mp3": "audio/mpeg",
+  "audio/x-mpeg": "audio/mpeg",
+  "audio/x-mpeg-3": "audio/mpeg",
+  "audio/mpg": "audio/mpeg",
+  "audio/m4a": "audio/mp4",
+  "audio/x-m4a": "audio/mp4",
+  "audio/wave": "audio/wav",
+  "audio/x-wav": "audio/wav",
+  "audio/vnd.wave": "audio/wav",
+  "audio/x-pn-wav": "audio/wav",
+  "audio/x-flac": "audio/flac",
+  "audio/x-aac": "audio/aac",
+  "audio/vorbis": "audio/ogg",
+  "audio/opus": "audio/ogg",
+};
+
+const AUDIO_EXTENSIONS: Record<string, string> = {
+  "audio/mpeg": "mp3",
+  "audio/mp4": "m4a",
+  "audio/aac": "aac",
+  "audio/ogg": "ogg",
+  "audio/wav": "wav",
+  "audio/flac": "flac",
+  "audio/webm": "webm",
+};
+
+/**
+ * Normalizes a media MIME type: strips parameters, lowercases it, and maps
+ * non-standard audio aliases that browsers send (e.g., `audio/mp3`) to their
+ * canonical forms (e.g., `audio/mpeg`).
+ */
+export function normalizeMediaType(type: string): string {
+  const base = type.split(";")[0].trim().toLowerCase();
+  return AUDIO_MIME_TYPE_ALIASES[base] ?? base;
+}
+
+/**
+ * Gets the file extension for a (normalized) media MIME type.  Unlike
+ * `mime.getExtension()`, this returns `mp3` rather than `mpga` for
+ * `audio/mpeg`, and covers `audio/flac`.
+ */
+export function getMediaExtension(type: string): string | null {
+  return AUDIO_EXTENSIONS[type] ?? mime.getExtension(type);
+}
 
 export interface Thumbnail {
   thumbnailUrl: string;

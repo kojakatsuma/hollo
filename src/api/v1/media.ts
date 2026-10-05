@@ -1,10 +1,17 @@
 import { eq } from "drizzle-orm";
 import { Hono, type Context } from "hono";
 import mime from "mime";
+import type { Metadata, Sharp } from "sharp";
 
 import { db } from "../../db";
 import { serializeMedium } from "../../entities/medium";
-import { makeVideoScreenshot, uploadThumbnail } from "../../media";
+import {
+  getDefaultScreenshot,
+  getMediaExtension,
+  makeVideoScreenshot,
+  normalizeMediaType,
+  uploadThumbnail,
+} from "../../media";
 import {
   scopeRequired,
   tokenRequired,
@@ -30,21 +37,42 @@ export async function postMedia(
     return c.json({ error: "file is required" }, 422);
   }
   const description = form.get("description")?.toString();
+  // Clients like curl send application/octet-stream (or nothing) unless told
+  // otherwise, so fall back to guessing the type from the file name:
+  const fileType = normalizeMediaType(
+    file.type === "" || file.type === "application/octet-stream"
+      ? (mime.getType(file.name) ?? file.type)
+      : file.type,
+  );
+  const isVideo = fileType.startsWith("video/");
+  const isAudio = fileType.startsWith("audio/");
   const id = uuidv7();
   const imageData = new Uint8Array(await file.arrayBuffer());
   let imageBytes: Uint8Array = imageData;
-  if (file.type.startsWith("video/")) {
+  if (isVideo) {
     imageBytes = await makeVideoScreenshot(imageData);
+  } else if (isAudio) {
+    // Audio files are stored as is; we don't extract cover art, but always
+    // use the default screenshot as the thumbnail:
+    imageBytes = getDefaultScreenshot();
   }
 
-  const image = sharp(imageBytes).rotate();
-  const rmMetaImage = await image.keepIccProfile().toBuffer();
-  const fileMetadata = await sharp(rmMetaImage).metadata();
-  const content = file.type.startsWith("video/")
-    ? new Uint8Array(imageData)
-    : new Uint8Array(rmMetaImage);
+  let image: Sharp;
+  let rmMetaImage: Buffer;
+  let fileMetadata: Metadata;
+  try {
+    image = sharp(imageBytes).rotate();
+    rmMetaImage = await image.keepIccProfile().toBuffer();
+    fileMetadata = await sharp(rmMetaImage).metadata();
+  } catch (_error) {
+    return c.json({ error: "Unsupported or corrupted media file" }, 422);
+  }
+  const content =
+    isVideo || isAudio
+      ? new Uint8Array(imageData)
+      : new Uint8Array(rmMetaImage);
 
-  const extension = mime.getExtension(file.type);
+  const extension = getMediaExtension(fileType);
   if (!extension) {
     return c.json({ error: "Unsupported media type" }, 400);
   }
@@ -52,7 +80,7 @@ export async function postMedia(
   const path = `media/${id}/original.${sanitizedExt}`;
   try {
     await disk.put(path, content, {
-      contentType: file.type,
+      contentType: fileType,
       contentLength: content.byteLength,
       visibility: "public",
     });
@@ -64,7 +92,7 @@ export async function postMedia(
     .insert(media)
     .values({
       id,
-      type: file.type,
+      type: fileType,
       url,
       width: fileMetadata.width!,
       height: fileMetadata.height!,

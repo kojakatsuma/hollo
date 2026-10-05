@@ -5,6 +5,7 @@ import metadata from "../../../package.json" with { type: "json" };
 import { db } from "../../db";
 import { serializeAccountOwner } from "../../entities/account";
 import { getInstanceHost } from "../../instance-host";
+import { SUPPORTED_MEDIA_TYPES } from "../../media";
 import { accountOwners, posts } from "../../schema";
 
 const TTL_MS = 5 * 60 * 1000;
@@ -98,17 +99,11 @@ app.get("/", async (c) => {
         characters_reserved_per_url: 256,
       },
       media_attachments: {
-        supported_mime_types: [
-          "image/jpeg",
-          "image/png",
-          "image/gif",
-          "image/webp",
-          "video/mp4",
-          "video/webm",
-        ],
+        supported_mime_types: SUPPORTED_MEDIA_TYPES,
         // TODO: Make these configurable
         image_size_limit: 1024 * 1024 * 32, // 32MiB
         image_matrix_limit: 16_777_216,
+        // Mastodon has no separate audio limit; clients apply this to audio:
         video_size_limit: 1024 * 1024 * 128, // 128MiB
         video_frame_rate_limit: 120,
         video_matrix_limit: 16_777_216,

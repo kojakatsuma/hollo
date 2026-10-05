@@ -1,6 +1,8 @@
 import type { Context, InboxContext } from "@fedify/fedify";
 import {
   Announce,
+  Audio,
+  Document,
   Image,
   InteractionPolicy,
   InteractionRule,
@@ -504,6 +506,88 @@ describe("persistPost", () => {
           : null,
       ),
     ).toEqual([firstUrl, secondUrl]);
+  });
+
+  it("stores remote audio attachments and federates them as Audio", async () => {
+    expect.assertions(7);
+    const author = await seedRemoteAccount("audio-author");
+    const documentUrl = "https://remote.test/media/song.mp3";
+    const audioUrl = "https://remote.test/media/song.ogg";
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (input) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        return new Response(new Uint8Array([0x49, 0x44, 0x33]), {
+          headers: {
+            "Content-Type": url.endsWith(".mp3") ? "audio/mpeg" : "audio/ogg",
+          },
+        });
+      });
+    const result = await (async () => {
+      try {
+        return await persistPost(
+          db,
+          new Note({
+            id: new URL("https://remote.test/@audio-author/posts/1"),
+            attribution: createPerson(author),
+            content: "<p>Two songs</p>",
+            attachments: [
+              // Mastodon federates audio as Document:
+              new Document({
+                mediaType: "audio/mpeg",
+                url: new URL(documentUrl),
+              }),
+              new Audio({ mediaType: "audio/ogg", url: new URL(audioUrl) }),
+            ],
+            to: PUBLIC_COLLECTION,
+          }),
+          "https://hollo.test",
+          { account: author },
+        );
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    })();
+    if (result == null) throw new Error("Failed to persist post");
+
+    const storedMedia = await db.query.media.findMany({
+      where: { postId: { eq: result.id } },
+      orderBy: { position: "asc" },
+    });
+    expect(storedMedia.map((medium) => medium.url)).toEqual([
+      documentUrl,
+      audioUrl,
+    ]);
+    expect(storedMedia.map((medium) => medium.type)).toEqual([
+      "audio/mpeg",
+      "audio/ogg",
+    ]);
+    // The default screenshot is used as a local thumbnail, rather than
+    // pointing the preview at the audio file itself:
+    for (const medium of storedMedia) {
+      expect(medium.thumbnailType).toBe("image/webp");
+      expect(medium.thumbnailUrl).toMatch(/\/thumbnail\.webp$/);
+    }
+
+    const post = await db.query.posts.findFirst({
+      where: { id: { eq: result.id } },
+      with: {
+        account: { with: { owner: true } },
+        replyTarget: true,
+        quoteTarget: true,
+        media: true,
+        poll: { with: { options: true } },
+        mentions: { with: { account: true } },
+      },
+    });
+    if (post == null) throw new Error("Failed to load post");
+    const object = toObject(post, {} as Context<unknown>);
+    const attachments = await Array.fromAsync(object.getAttachments());
+    expect(
+      attachments.map((attachment) =>
+        attachment instanceof Audio ? attachment.mediaType : null,
+      ),
+    ).toEqual(["audio/mpeg", "audio/ogg"]);
   });
 
   it("does not fetch remote replies collections synchronously", async () => {
