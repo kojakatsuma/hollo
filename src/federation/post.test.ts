@@ -21,6 +21,7 @@ import { cleanDatabase } from "../../tests/helpers";
 import { createAccount } from "../../tests/helpers/oauth";
 import db from "../db";
 import { accounts, follows, instances, polls, posts } from "../schema";
+import { drive } from "../storage";
 import type { Uuid } from "../uuid";
 import { toTemporalInstant } from "./date";
 import { onPostShared } from "./inbox";
@@ -513,6 +514,7 @@ describe("persistPost", () => {
     const author = await seedRemoteAccount("audio-author");
     const documentUrl = "https://remote.test/media/song.mp3";
     const audioUrl = "https://remote.test/media/song.ogg";
+    drive.fake();
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockImplementation(async (input) => {
@@ -546,6 +548,7 @@ describe("persistPost", () => {
         );
       } finally {
         fetchSpy.mockRestore();
+        drive.restore();
       }
     })();
     if (result == null) throw new Error("Failed to persist post");

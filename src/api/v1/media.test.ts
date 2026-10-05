@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import sharp from "sharp";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { cleanDatabase } from "../../../tests/helpers";
 import {
@@ -14,6 +14,7 @@ import {
 import db from "../../db";
 import app from "../../index";
 import { credentials } from "../../schema";
+import { drive } from "../../storage";
 
 // A stand-in for an MP3 file; the audio stream is never decoded on upload:
 const audioBytes = new Uint8Array([0x49, 0x44, 0x33, 0x04, 0, 0, 0, 0, 0, 0]);
@@ -36,10 +37,15 @@ describe.sequential("POST /api/v1/media with audio", () => {
 
   beforeEach(async () => {
     await cleanDatabase();
+    drive.fake();
 
     const account = await createAccount();
     const client = await createOAuthApplication({ scopes: ["write"] });
     accessToken = await getAccessToken(client, account, ["write"]);
+  });
+
+  afterEach(() => {
+    drive.restore();
   });
 
   async function upload(endpoint: string, file: File) {
@@ -148,6 +154,5 @@ describe.each(["/api/v1/instance", "/api/v2/instance"])("GET %s", (path) => {
 });
 
 async function readStoredFile(path: string): Promise<Uint8Array> {
-  const { drive } = await import("../../storage");
   return new Uint8Array(await drive.use().getBytes(path));
 }
