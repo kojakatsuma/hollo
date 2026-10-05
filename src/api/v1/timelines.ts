@@ -5,6 +5,7 @@ import {
   desc,
   eq,
   gt,
+  inArray,
   isNull,
   lt,
   lte,
@@ -159,6 +160,35 @@ async function readTimelineSnapshot<T>(
     isolationLevel: "repeatable read",
     accessMode: "read only",
   });
+}
+
+// Hide the posts (including boosts) from the members of the owner's
+// exclusive lists, which are shown only in their list timelines.  The owner's
+// own posts and the posts mentioning the owner are kept in the home timeline:
+function buildExclusiveListFilterCondition(
+  ownerId: Uuid,
+  table = posts,
+): SQL | undefined {
+  return or(
+    eq(table.accountId, ownerId),
+    inArray(
+      table.id,
+      db
+        .select({ id: mentions.postId })
+        .from(mentions)
+        .where(eq(mentions.accountId, ownerId)),
+    ),
+    notInArray(
+      table.accountId,
+      db
+        .select({ accountId: listMembers.accountId })
+        .from(listMembers)
+        .innerJoin(lists, eq(listMembers.listId, lists.id))
+        .where(
+          and(eq(lists.accountOwnerId, ownerId), eq(lists.exclusive, true)),
+        ),
+    ),
+  );
 }
 
 function getTimelinePostFilterConditions(ownerId: Uuid): (SQL | undefined)[] {
@@ -419,6 +449,7 @@ app.get(
                 ? undefined
                 : gt(timelinePosts.postId, lowerBound),
               ...getTimelinePostFilterConditions(owner.id),
+              buildExclusiveListFilterCondition(owner.id),
             ),
           )
           .orderBy(
@@ -459,14 +490,6 @@ app.get(
                   and(
                     ne(posts.visibility, "direct"),
                     postAccountIdInArray(followingAccountIds, posts),
-                    notInArray(
-                      posts.accountId,
-                      db
-                        .select({ id: listMembers.accountId })
-                        .from(listMembers)
-                        .leftJoin(lists, eq(listMembers.listId, lists.id))
-                        .where(eq(lists.exclusive, true)),
-                    ),
                   ),
                   and(
                     ne(posts.visibility, "private"),
@@ -503,6 +526,7 @@ app.get(
                       ),
                   ),
                 ),
+                buildExclusiveListFilterCondition(owner.id, posts),
                 // Hide future posts
                 lte(posts.published, sql`NOW() + INTERVAL '5 minutes'`),
                 // Hide the posts from the muted accounts:

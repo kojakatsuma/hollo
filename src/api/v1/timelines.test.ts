@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { cleanDatabase } from "../../../tests/helpers";
@@ -704,6 +705,159 @@ describe.sequential("/api/v1/timelines/home", () => {
     expect(json[0].quote).toBeNull();
     expect(json[0].content).toContain("quote-inline");
     expect(json[0].content).toContain(quotedPostUrl);
+  });
+});
+
+describe.sequential("/api/v1/timelines/home (exclusive lists)", () => {
+  let owner: Awaited<ReturnType<typeof createAccount>>;
+  let member: Awaited<ReturnType<typeof createAccount>>;
+  let other: Awaited<ReturnType<typeof createAccount>>;
+  let client: Awaited<ReturnType<typeof createOAuthApplication>>;
+  let accessToken: Awaited<ReturnType<typeof getAccessToken>>;
+  let listId: Uuid;
+
+  beforeEach(async () => {
+    await cleanDatabase();
+
+    owner = await createAccount({ username: "exclusive-owner" });
+    member = await createAccount({ username: "exclusive-member" });
+    other = await createAccount({ username: "exclusive-other" });
+    client = await createOAuthApplication({
+      scopes: ["read:statuses", "read:lists"],
+    });
+    accessToken = await getAccessToken(client, owner, [
+      "read:statuses",
+      "read:lists",
+    ]);
+
+    await db.insert(follows).values(
+      [member, other].map((account) => ({
+        iri: `https://hollo.test/follows/${crypto.randomUUID()}`,
+        followingId: account.id,
+        followerId: owner.id,
+        approved: new Date(),
+      })),
+    );
+
+    listId = uuidv7();
+    await db.insert(lists).values({
+      id: listId,
+      accountOwnerId: owner.id,
+      title: "Exclusive list",
+      repliesPolicy: "list",
+      exclusive: true,
+    });
+    await db.insert(listMembers).values({ listId, accountId: member.id });
+  });
+
+  async function insertPost(
+    account: { id: Uuid },
+    values: Partial<typeof posts.$inferInsert> = {},
+  ): Promise<Uuid> {
+    const id = uuidv7();
+    await db.insert(posts).values({
+      id,
+      iri: `https://hollo.test/posts/${id}`,
+      type: "Note",
+      accountId: account.id,
+      visibility: "public",
+      content: "Post",
+      contentHtml: "<p>Post</p>",
+      published: new Date(),
+      ...values,
+    });
+    await db.insert(timelinePosts).values({ accountId: owner.id, postId: id });
+    return id;
+  }
+
+  async function fetchHomeIds(): Promise<string[]> {
+    const response = await app.request("/api/v1/timelines/home", {
+      headers: { authorization: bearerAuthorization(accessToken) },
+    });
+    expect(response.status).toBe(200);
+    const json = (await response.json()) as { id: string }[];
+    return json.map((status) => status.id);
+  }
+
+  it("hides posts and boosts from exclusive list members", async () => {
+    expect.assertions(2);
+
+    const otherPostId = await insertPost(other);
+    const ownPostId = await insertPost(owner);
+    await insertPost(member);
+    await insertPost(member, {
+      sharingId: otherPostId,
+      content: null,
+      contentHtml: null,
+    });
+
+    const ids = await fetchHomeIds();
+
+    expect(ids).toEqual([ownPostId, otherPostId]);
+  });
+
+  it("keeps posts from exclusive list members that mention the owner", async () => {
+    expect.assertions(2);
+
+    await insertPost(member);
+    const mentionPostId = await insertPost(member);
+    await db
+      .insert(mentions)
+      .values({ postId: mentionPostId, accountId: owner.id });
+
+    const ids = await fetchHomeIds();
+
+    expect(ids).toEqual([mentionPostId]);
+  });
+
+  it("does not hide posts from members of non-exclusive lists", async () => {
+    expect.assertions(2);
+
+    await db
+      .update(lists)
+      .set({ exclusive: false })
+      .where(eq(lists.id, listId));
+    const memberPostId = await insertPost(member);
+
+    const ids = await fetchHomeIds();
+
+    expect(ids).toEqual([memberPostId]);
+  });
+
+  it("ignores exclusive lists owned by other accounts", async () => {
+    expect.assertions(2);
+
+    const otherListId = uuidv7();
+    await db.insert(lists).values({
+      id: otherListId,
+      accountOwnerId: other.id,
+      title: "Another owner's exclusive list",
+      repliesPolicy: "list",
+      exclusive: true,
+    });
+    await db
+      .insert(listMembers)
+      .values({ listId: otherListId, accountId: other.id });
+    const otherPostId = await insertPost(other);
+
+    const ids = await fetchHomeIds();
+
+    expect(ids).toEqual([otherPostId]);
+  });
+
+  it("still shows the posts in the exclusive list timeline", async () => {
+    expect.assertions(2);
+
+    const memberPostId = await insertPost(member);
+    await db.insert(listPosts).values({ listId, postId: memberPostId });
+
+    const response = await app.request(`/api/v1/timelines/list/${listId}`, {
+      headers: { authorization: bearerAuthorization(accessToken) },
+    });
+    expect(response.status).toBe(200);
+    const json = (await response.json()) as { id: string }[];
+
+    expect(json.map((status) => status.id)).toEqual([memberPostId]);
   });
 });
 
