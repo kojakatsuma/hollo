@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 
 import v1 from "./v1";
 import v2 from "./v2";
+import { VIEWING_HOURS_NEXT_HEADER } from "./viewing-hours";
 
 const app = new Hono();
 
@@ -14,7 +15,7 @@ app.use(
   cors({
     origin: "*",
     allowMethods: ["GET", "HEAD", "PUT", "POST", "DELETE", "PATCH"],
-    exposeHeaders: ["Link"],
+    exposeHeaders: ["Link", VIEWING_HOURS_NEXT_HEADER],
   }),
 );
 app.route("/v1", v1);

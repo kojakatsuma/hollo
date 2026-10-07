@@ -28,10 +28,34 @@ import { type Account } from "../../schema";
 import { buildSearchFilter, parseSearchQuery } from "../../search";
 import { uuid } from "../../uuid";
 import { postMedia } from "../v1/media";
+import {
+  emptyOutsideViewingHours,
+  forbiddenOutsideViewingHours,
+} from "../viewing-hours";
 import instance from "./instance";
 import notificationsRoutes from "./notifications";
 
 const app = new Hono<{ Variables: AccountOwnerVariables }>();
+
+// Endpoints that read others' posts and notifications are closed outside
+// the viewing hours (VIEWING_HOURS).  These guards have to be registered
+// before the routes they protect, and /notifications/unread_count has to
+// come before /notifications/:group_key:
+app.get(
+  "/notifications",
+  emptyOutsideViewingHours({
+    accounts: [],
+    statuses: [],
+    notification_groups: [],
+  }),
+);
+app.get("/notifications/unread_count", emptyOutsideViewingHours({ count: 0 }));
+app.get("/notifications/:group_key/accounts", emptyOutsideViewingHours([]));
+app.get("/notifications/:group_key", forbiddenOutsideViewingHours());
+app.get(
+  "/search",
+  emptyOutsideViewingHours({ accounts: [], statuses: [], hashtags: [] }),
+);
 
 app.route("/instance", instance);
 app.route("/notifications", notificationsRoutes);

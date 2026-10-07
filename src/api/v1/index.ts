@@ -15,6 +15,13 @@ import {
   type AccountOwnerVariables,
 } from "../../oauth/middleware";
 import { uuid } from "../../uuid";
+import {
+  emptyOutsideViewingHours,
+  forbiddenOutsideViewingHours,
+  isOwnAccount,
+  isOwnPoll,
+  isOwnPost,
+} from "../viewing-hours";
 import accounts from "./accounts";
 import apps from "./apps";
 import featured_tags from "./featured_tags";
@@ -31,6 +38,31 @@ import tags from "./tags";
 import timelines from "./timelines";
 
 const app = new Hono<{ Variables: AccountOwnerVariables }>();
+
+// Endpoints that read others' posts and notifications are closed outside
+// the viewing hours (VIEWING_HOURS).  These guards have to be registered
+// before the routes they protect:
+app.get("/timelines/*", emptyOutsideViewingHours([]));
+app.get("/notifications", emptyOutsideViewingHours([]));
+app.get("/favourites", emptyOutsideViewingHours([]));
+app.get("/bookmarks", emptyOutsideViewingHours([]));
+app.get(
+  "/accounts/:id/statuses",
+  emptyOutsideViewingHours([], { exemptIf: isOwnAccount }),
+);
+app.get("/statuses/:id", forbiddenOutsideViewingHours({ exemptIf: isOwnPost }));
+app.get(
+  "/statuses/:id/source",
+  forbiddenOutsideViewingHours({ exemptIf: isOwnPost }),
+);
+app.get(
+  "/statuses/:id/context",
+  emptyOutsideViewingHours({ ancestors: [], descendants: [] }),
+);
+app.get("/statuses/:id/favourited_by", emptyOutsideViewingHours([]));
+app.get("/statuses/:id/reblogged_by", emptyOutsideViewingHours([]));
+app.get("/statuses/:id/quotes", emptyOutsideViewingHours([]));
+app.get("/polls/:id", forbiddenOutsideViewingHours({ exemptIf: isOwnPoll }));
 
 app.route("/apps", apps);
 app.route("/accounts", accounts);
