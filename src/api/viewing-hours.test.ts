@@ -290,10 +290,10 @@ describe.sequential("viewing hours", () => {
     });
   });
 
-  describe("without VIEWING_HOURS", () => {
+  describe("with VIEWING_HOURS=off", () => {
     it("does not restrict anything", async () => {
       expect.assertions(4);
-      config.hours = null;
+      config.hours = parseViewingHours("off");
       vi.setSystemTime(OUTSIDE);
       const post = await get(`/api/v1/statuses/${remotePostId}`);
       expect(post.status).toBe(200);

@@ -21,11 +21,21 @@ function parse(value: string, timeZone?: string): ViewingHours {
 }
 
 describe("parseViewingHours", () => {
-  it("returns null when unset or blank", () => {
+  it("defaults to 12:00-14:00 when unset or blank", () => {
     expect.assertions(3);
-    expect(parseViewingHours(undefined)).toBeNull();
-    expect(parseViewingHours("")).toBeNull();
-    expect(parseViewingHours("   ")).toBeNull();
+    const expected = {
+      ranges: [{ start: 12 * 60, end: 14 * 60 }],
+      timeZone: "Asia/Tokyo",
+    };
+    expect(parseViewingHours(undefined)).toEqual(expected);
+    expect(parseViewingHours("")).toEqual(expected);
+    expect(parseViewingHours("   ")).toEqual(expected);
+  });
+
+  it("returns null when turned off", () => {
+    expect.assertions(2);
+    expect(parseViewingHours("off")).toBeNull();
+    expect(parseViewingHours(" OFF ")).toBeNull();
   });
 
   it("parses multiple ranges in Asia/Tokyo by default", () => {

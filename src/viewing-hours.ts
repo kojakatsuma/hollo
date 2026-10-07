@@ -15,6 +15,7 @@ export interface ViewingHours {
   readonly timeZone: string;
 }
 
+export const DEFAULT_VIEWING_HOURS = "12:00-14:00";
 export const DEFAULT_VIEWING_HOURS_TIME_ZONE = "Asia/Tokyo";
 
 const RANGE_PATTERN = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/;
@@ -28,9 +29,11 @@ function parseMinutes(hour: string, minute: string): number | null {
 
 /**
  * Parses the `VIEWING_HOURS` value, e.g., `07:00-08:00,21:00-22:00`.
- * @param value The comma-separated list of `HH:MM-HH:MM` ranges.
+ * @param value The comma-separated list of `HH:MM-HH:MM` ranges, or `off`
+ *              to disable the restriction.  When unset or blank,
+ *              {@link DEFAULT_VIEWING_HOURS} is used.
  * @param timeZone The IANA time zone in which the ranges are interpreted.
- * @returns The parsed viewing hours, or `null` if `value` is unset or blank
+ * @returns The parsed viewing hours, or `null` if `value` is `off`
  *          (which means viewing is not restricted).
  * @throws {TypeError} If `value` or `timeZone` is malformed.
  */
@@ -38,9 +41,10 @@ export function parseViewingHours(
   value: string | undefined,
   timeZone: string = DEFAULT_VIEWING_HOURS_TIME_ZONE,
 ): ViewingHours | null {
-  if (value == null || value.trim() === "") return null;
+  const trimmed = value?.trim() || DEFAULT_VIEWING_HOURS;
+  if (trimmed.toLowerCase() === "off") return null;
   const ranges: ViewingHoursRange[] = [];
-  for (const item of value.split(",")) {
+  for (const item of trimmed.split(",")) {
     const match = RANGE_PATTERN.exec(item.trim());
     const start = match == null ? null : parseMinutes(match[1], match[2]);
     const end = match == null ? null : parseMinutes(match[3], match[4]);

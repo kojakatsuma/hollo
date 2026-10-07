@@ -433,7 +433,7 @@ STORAGE_URL_BASE=https://your-bucket.s3.amazonaws.com
 | `REMOTE_MEDIA_THUMBNAILS`                | on      | Generate local sharp thumbnails for remote attachments (boolean)                                                |
 | `HANDLE_HOST`                            | -       | Split-domain WebFinger handle host (e.g. `example.com`); must be set together with `WEB_ORIGIN`                 |
 | `WEB_ORIGIN`                             | -       | Split-domain ActivityPub server origin (e.g. `https://ap.example.com`); must be set together with `HANDLE_HOST` |
-| `VIEWING_HOURS`                          | -       | Mastodon API time ranges for reading others' posts (e.g. `07:00-08:00,23:00-01:00`)                             |
+| `VIEWING_HOURS`                          | -       | Time ranges for reading others' posts via API (default `12:00-14:00`; `off` disables)                           |
 | `VIEWING_HOURS_TZ`                       | -       | IANA time zone for `VIEWING_HOURS` (default `Asia/Tokyo`); independent of the OS time zone                      |
 
 
