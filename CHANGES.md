@@ -1,6 +1,106 @@
 Hollo changelog
 ===============
 
+Version 0.9.25
+--------------
+
+Released on October 24, 2026.
+
+ -  Upgraded Fedify to 2.2.20 to address a security vulnerability in SSRF
+    protection.  [[GHSA-r48c-xx2h-fv4g]]
+ -  Updated the Docker image to Node.js 24.22.1, which fixes the
+    [October 2026 Node.js security vulnerabilities].
+ -  Distrusted the [compromised eMudhra intermediate CAs] in
+    the Docker image's system certificate store, following [Debian's fix].
+    Updated the build tool mise to 2026.10.18, which also includes the
+    certificate fix for its bundled npm backend.  The Node.js 24.22.1
+    update also includes its own fix for the compromised intermediates.
+
+[GHSA-r48c-xx2h-fv4g]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-r48c-xx2h-fv4g
+[October 2026 Node.js security vulnerabilities]: https://nodejs.org/en/blog/vulnerability/october-2026-security-releases
+[compromised eMudhra intermediate CAs]: https://emudhra.we-have-a-problem.com/
+[Debian's fix]: https://bugs.debian.org/1151413
+
+
+Version 0.9.24
+--------------
+
+Released on October 17, 2026.
+
+ -  Fixed a security vulnerability where any authenticated user with the
+    `write:statuses` scope could delete another local account's post or a
+    cached remote post by its UUID and receive the deleted post's contents.
+    Status deletion now requires the post to belong to the account associated
+    with the access token.  [[GHSA-v2qh-w789-xxj6]]
+
+[GHSA-v2qh-w789-xxj6]: https://github.com/fedify-dev/hollo/security/advisories/GHSA-v2qh-w789-xxj6
+
+
+Version 0.9.23
+--------------
+
+Released on October 14, 2026.
+
+ -  Upgraded Fedify to 2.2.19, which fixes two security vulnerabilities:
+    inboxes accepting signed activities whose IDs had a different origin
+    from their actors, which let any remote actor have forged objects
+    trusted as if they came from another server and suppress the genuine
+    activity with the same ID as a duplicate, and key ownership checks
+    accepting a different actor's document when an actor ID redirected to
+    or served it, which let an attacker whose actor document was reached
+    through a victim's actor ID sign activities that passed authentication
+    as the victim's.  Keys cached under the weaker ownership check are
+    fetched and verified again after upgrading.
+    [[GHSA-4qhx-hhwf-8685], [GHSA-8863-8468-7hq7]]
+
+[GHSA-4qhx-hhwf-8685]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-4qhx-hhwf-8685
+[GHSA-8863-8468-7hq7]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-8863-8468-7hq7
+
+
+Version 0.9.22
+--------------
+
+Released on October 5, 2026.
+
+ -  Fixed the language of remote posts not being stored when they were
+    received from Mastodon, Hollo, or any other software that sends `content`
+    together with `contentMap`.  [[#647], [#659]]
+
+ -  Upgraded Fedify to 2.2.16, which normalizes BCP 47 extended language
+    subtags before parsing language tags.  Language-tagged strings with tags
+    like `zh-YUE`, which Mastodon uses for Cantonese, were previously dropped
+    because `Intl.Locale` rejects them; they are now kept with the canonical
+    tag (e.g., `yue`).  [[#647], [fedify-dev/fedify#1229], [#659]]
+
+[fedify-dev/fedify#1229]: https://github.com/fedify-dev/fedify/issues/1229
+[#647]: https://github.com/fedify-dev/hollo/issues/647
+[#659]: https://github.com/fedify-dev/hollo/pull/659
+
+
+Version 0.9.21
+--------------
+
+Released on October 1, 2026.
+
+ -  Upgraded Fedify to 2.2.15, which fixes a security vulnerability where
+    `Context.routeActivity()` authenticated the dereferenced activity but
+    routed the caller's unauthenticated copy, so an attacker who knew the `id`
+    of any dereferenceable activity could have the application's inbox
+    listeners process an activity with that `id` but with an actor, object,
+    and addressing of the attacker's choice, and the genuine activity could
+    then be dropped as a duplicate.  The verified fetched document is now the
+    one that gets queued, handed to listeners, and forwarded.
+    [[GHSA-39gj-rchc-q5m3]]
+
+ -  Fixed slow home, public, and list timeline queries on large databases by
+    checking the shared post directly when filtering muted or blocked authors.
+    [[#633], [#634]]
+
+[GHSA-39gj-rchc-q5m3]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-39gj-rchc-q5m3
+[#633]: https://github.com/fedify-dev/hollo/issues/633
+[#634]: https://github.com/fedify-dev/hollo/pull/634
+
+
 Version 0.9.20
 --------------
 
@@ -760,6 +860,68 @@ Released on May 20, 2026.
 [#491]: https://github.com/fedify-dev/hollo/pull/491
 [#492]: https://github.com/fedify-dev/hollo/issues/492
 [#493]: https://github.com/fedify-dev/hollo/pull/493
+
+
+Version 0.8.17
+--------------
+
+Released on October 24, 2026.
+
+ -  Upgraded Fedify to 2.1.31 to address a security vulnerability in SSRF
+    protection.  [[GHSA-r48c-xx2h-fv4g]]
+ -  Updated the Docker image to Node.js 24.22.1, which fixes the
+    [October 2026 Node.js security vulnerabilities].
+ -  Distrusted the [compromised eMudhra intermediate CAs] in
+    the Docker image's system certificate store, following [Debian's fix].
+    Updated the build tool mise to 2026.10.18, which also includes the
+    certificate fix for its bundled npm backend.  The Node.js 24.22.1
+    update also includes its own fix for the compromised intermediates.
+
+
+Version 0.8.16
+--------------
+
+Released on October 17, 2026.
+
+ -  Fixed a security vulnerability where any authenticated user with the
+    `write:statuses` scope could delete another local account's post or a
+    cached remote post by its UUID and receive the deleted post's contents.
+    Status deletion now requires the post to belong to the account associated
+    with the access token.  [[GHSA-v2qh-w789-xxj6]]
+
+
+Version 0.8.15
+--------------
+
+Released on October 14, 2026.
+
+ -  Upgraded Fedify to 2.1.30, which fixes two security vulnerabilities:
+    inboxes accepting signed activities whose IDs had a different origin
+    from their actors, which let any remote actor have forged objects
+    trusted as if they came from another server and suppress the genuine
+    activity with the same ID as a duplicate, and key ownership checks
+    accepting a different actor's document when an actor ID redirected to
+    or served it, which let an attacker whose actor document was reached
+    through a victim's actor ID sign activities that passed authentication
+    as the victim's.  Keys cached under the weaker ownership check are
+    fetched and verified again after upgrading.
+    [[GHSA-4qhx-hhwf-8685], [GHSA-8863-8468-7hq7]]
+
+
+Version 0.8.14
+--------------
+
+Released on October 1, 2026.
+
+ -  Upgraded Fedify to 2.1.26, which fixes a security vulnerability where
+    `Context.routeActivity()` authenticated the dereferenced activity but
+    routed the caller's unauthenticated copy, so an attacker who knew the `id`
+    of any dereferenceable activity could have the application's inbox
+    listeners process an activity with that `id` but with an actor, object,
+    and addressing of the attacker's choice, and the genuine activity could
+    then be dropped as a duplicate.  The verified fetched document is now the
+    one that gets queued, handed to listeners, and forwarded.
+    [[GHSA-39gj-rchc-q5m3]]
 
 
 Version 0.8.13
