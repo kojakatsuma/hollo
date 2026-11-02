@@ -8,6 +8,8 @@ on:
       - "*.*-maintenance"
     tags:
       - "*.*.*"
+  # Fork: allows re-running build-image and deploy from the Actions tab.
+  workflow_dispatch:
 
 jobs:
   check:
@@ -30,8 +32,13 @@ jobs:
           ! grep -i "to be released" CHANGES.md
 
   build-image:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [check]
+    # Fork: keep pushes of the same ref in order so that an older run never
+    # overwrites the stable tag after a newer one.
+    concurrency:
+      group: build-image-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -54,16 +61,26 @@ jobs:
         run: '[[ "$VERSION" = "$GITHUB_REF_NAME" ]]'
         env:
           VERSION: ${{ steps.version.outputs.value }}
+      # Fork: stable (only on the stable branch) and sha-xxxxxxx tags are
+      # used by the deploy job and for rollbacks on the VPS.
+      - if: github.ref_type != 'tag'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=git-${{ github.sha }}
+            type=raw,value=${{ steps.version.outputs.value }}-dev.${{ github.run_number }}
+            type=raw,value=canary
+            type=raw,value=stable,enable=${{ github.ref == 'refs/heads/stable' }}
+            type=sha
       - if: github.ref_type != 'tag'
         uses: docker/build-push-action@v5
         with:
           push: true
           platforms: linux/amd64
           build-args: VERSION=${{ steps.version.outputs.value }}-dev.${{ github.run_number }}
-          tags: |
-            ghcr.io/${{ github.repository }}:git-${{ github.sha }}
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.value }}-dev.${{ github.run_number }}
-            ghcr.io/${{ github.repository }}:canary
+          tags: ${{ steps.meta.outputs.tags }}
           labels: org.opencontainers.image.revision=${{ github.sha }}
           annotations: |
             org.opencontainers.image.title=Hollo
@@ -97,6 +114,29 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.value }}
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:build-cache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:build-cache,mode=max
+
+  # Fork: deploys the freshly pushed stable image to the VPS.  The SSH key
+  # is restricted by command= in authorized_keys to run deploy.sh only.
+  deploy:
+    if: |
+      github.ref == 'refs/heads/stable' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [build-image]
+    runs-on: ubuntu-latest
+    permissions: {}
+    concurrency:
+      group: deploy-vps
+      cancel-in-progress: false
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          # TODO: Replace with the absolute path of deploy.sh on the VPS.
+          # (Ignored when authorized_keys forces command=, but used otherwise.)
+          script: "'/home/<user>/hollo/deploy.sh'"
 
   release:
     if: github.event_name == 'push'
