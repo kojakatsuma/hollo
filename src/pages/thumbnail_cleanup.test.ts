@@ -23,7 +23,7 @@ function createMediaItems(count: number): DeletableMedia {
   })) as DeletableMedia;
 }
 
-describe.sequential("thumbnail cleanup", () => {
+describe("thumbnail cleanup", { concurrent: false }, () => {
   beforeEach(async () => {
     await cleanDatabase();
     vi.mocked(getMediaWithDeletableThumbnails).mockReset();
@@ -66,4 +66,34 @@ describe.sequential("thumbnail cleanup", () => {
     expect(previewBody).toContain("Items");
     expect(previewBody).toContain("4,980");
   });
+});
+
+it("commits all thumbnail batches before dispatch", async () => {
+  const { default: db } = await import("../db");
+  const { cleanupJobs, cleanupJobItems } = await import("../schema");
+  const { backgroundJobs } = await import("../federation/federation");
+  const { uuidv7 } = await import("../uuid");
+  await cleanDatabase();
+  vi.mocked(getMediaWithDeletableThumbnails).mockResolvedValue(
+    Array.from({ length: 1001 }, () => ({ id: uuidv7() })) as DeletableMedia,
+  );
+  const dispatch = vi
+    .spyOn(backgroundJobs, "enqueueJob")
+    .mockImplementation(async () => {
+      expect(await db.select().from(cleanupJobs)).toHaveLength(1);
+      expect(await db.select().from(cleanupJobItems)).toHaveLength(1001);
+    });
+  try {
+    const form = new FormData();
+    form.set("before", "2026-04-12");
+    const response = await app.request("/thumbnail_cleanup/clean", {
+      method: "POST",
+      body: form,
+      headers: { Cookie: await getLoginCookie() },
+    });
+    expect(response.status).toBe(302);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  } finally {
+    dispatch.mockRestore();
+  }
 });

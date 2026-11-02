@@ -30,25 +30,128 @@ Worker separation is beneficial when:
 How it works
 ------------
 
-Hollo has five main components:
+Hollo has six main components:
 
  1. *Web server*: Handles HTTP requests (API, web UI)
  2. *Fedify message queue*: Processes ActivityPub inbox/outbox messages
  3. *Import worker*: Handles background data import jobs
  4. *Cleanup worker*: Handles background cleanup jobs
  5. *Remote replies scrape worker*: Fetches remote replies collections slowly
+ 6. *Poll notification tasks*: Notify local authors and voters after expiry
 
-By default (`NODE_TYPE=all`), all five run in a single process. You can
+By default (`NODE_TYPE=all`), all six run in a single process. You can
 separate them using the `NODE_TYPE` environment variable:
 
-| `NODE_TYPE` | Web server | Fedify queue | Import worker | Cleanup worker | Remote replies scrape worker |
-| ----------- | ---------- | ------------ | ------------- | -------------- | ---------------------------- |
-| `all` (default) | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `web` | ✓ | ✗ | ✗ | ✗ | ✗ |
-| `worker` | ✗ | ✓ | ✓ | ✓ | ✓ |
+| `NODE_TYPE` | Web server | Fedify queue | Import worker | Cleanup worker | Remote replies scrape worker | Poll notifications |
+| ----------- | ---------- | ------------ | ------------- | -------------- | ---------------------------- | ------------------ |
+| `all` (default) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `web` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `worker` | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+### Import and cleanup tasks
+
+Import and cleanup run as Fedify tasks on a separate PostgreSQL queue,
+with at most four item attempts per worker process.  Web nodes register and
+enqueue these tasks but never consume queues.  Worker and combined nodes also
+run a recovery pass once a minute, examining at most 100 active jobs per kind.
+This pass restores missed dispatches and interrupted work; it does not execute
+items itself.  Progress counts terminal results, rather than claimed items.
+
+Before upgrading from the polling workers, stop all older web and worker
+nodes, apply the database migrations, and deploy the same version to every
+node.  Do not mix task definitions across deployments.  Existing pending and
+processing items are recovered; incomplete legacy upload batches are marked
+failed and must be submitted again.  The existing federation queue and its
+messages retain their identity.
+
+A worker can use up to 24 database connections: the main pool of 20 and four
+isolated item-lock connections.  Queue separation does not isolate CPU or
+storage load.  Shutdown stops new attempts and waits up to 30 seconds for
+running work.  Forced termination leaves unfinished items recoverable.
+Transient failures retry at five-second intervals, failing after five recorded
+failures; process termination does not consume that budget.  External activity
+delivery may repeat after interruption, using the saved activity IDs.  Job
+cancellation prevents new work and does not undo actions already performed.
+Already committed import relationships still deliver their saved activities,
+including after cancellation during a retry.
+
 
 All nodes share the same PostgreSQL database, which acts as the message queue
 backend using `LISTEN`/`NOTIFY` for real-time message delivery.
+
+
+### Remote replies scrape tasks
+
+Remote replies scraping shares the dedicated task queue with import and cleanup.
+Each worker runs at most four application tasks, including at most two scrapes.
+Backpressure counts ready messages, so delayed wakeups do not block other work.
+PostgreSQL job and origin records still enforce collection cooldown, host request
+spacing, and HTTP 429 backoff across workers. Normal execution and retry wakeups
+use tasks; a startup and once-a-minute recovery pass examines at most 100 stale
+jobs and 100 stale orphan origin leases, and dispatches at most 50 runnable
+scrapes. It repairs missed enqueues and interrupted attempts without fetching
+remote collections itself. Jobs created within a transaction are dispatched by
+recovery after commit.
+
+Stop all older nodes before upgrading and deploy compatible task definitions
+on every node. Existing pending jobs are recovered, and processing jobs are
+reclaimed after their 15-minute heartbeat lease expires. Shutdown interrupts
+throttling waits and returns settled attempts to pending. A forced termination
+leaves the lease to expire. HTTP 429 retries use the recorded due time; other
+scrape errors remain terminal failures. The existing scrape environment
+variables and authenticated local-actor fetching retain their meaning.
+
+### Poll notification tasks
+
+Poll expiry notifications share the dedicated Fedify task queue. Web nodes
+schedule tasks; worker and combined nodes execute them, reloading the current
+expiry and local recipients. Changed expiries and duplicate messages cannot
+notify early or duplicate owner/poll notifications. Very distant expiries use
+wakeups of at most seven days. Delivery may occur after the recorded expiry.
+
+Startup and once-a-minute recovery enqueue at most 100 expired polls with
+missing notifications per pass. The scan advances through the backlog even
+while earlier tasks are pending or failed. It covers existing polls, downtime,
+missed post-commit dispatches, and exhausted task retries; recovery itself does
+not create notifications. Delayed messages do not count toward ready-queue
+backpressure. Transient task errors use exponential backoff for up to three
+attempts, then recovery can try again. Shutdown lets running transactions finish;
+interrupted work remains recoverable. Stop older nodes before upgrading and
+run compatible task definitions on every node.
+
+
+The shared database stores at most 100 pending poll messages, including delayed
+wakeups and retries, with one wakeup per poll for new schedules. Repeated votes
+and expiry updates coalesce: an earlier expiry advances the existing wakeup;
+a later expiry is reloaded when that wakeup runs. At the limit, an earlier
+wakeup replaces the latest one. Deferred or displaced polls are recovered after
+expiry. Bursts can also defer admission when its database lock cannot be
+acquired within one second. These limits apply across nodes, rather than per
+worker. They bound stored work, not notifications or running handlers.
+
+Delayed poll wakeups use the queue's five-second polling interval rather than
+allocating a timer in each worker. Recovery still pauses at 200 shared ready
+messages. The limit of 100 matches one recovery page; it is not a throughput
+guarantee. Stop all older producers before upgrading. Legacy queued messages
+count toward the limit, but an existing backlog above 100 drains gradually;
+new admissions do not increase that backlog.
+
+The `hollo.poll-notifications.queue` logger reports capacity deferrals,
+displaced wakeups and lock timeouts at warning level, at most once per reason
+per minute per process. Inspect storage pressure with the query below.
+Enqueue counters include coalesced and deferred attempts, so they do not
+measure stored messages.
+
+~~~~ sql
+SELECT count(*) AS queued,
+       count(*) FILTER (WHERE created + delay <= CURRENT_TIMESTAMP) AS ready,
+       count(*) FILTER (WHERE created + delay > CURRENT_TIMESTAMP) AS delayed,
+       count(*) FILTER (
+         WHERE message->>'type' = 'task'
+           AND message->>'taskName' = 'hollo.poll-notification.v1'
+       ) AS pending_polls
+FROM hollo_task_message_v1;
+~~~~
 
 
 Docker Compose setup
@@ -254,7 +357,7 @@ sudo journalctl -u hollo-worker -f
 When a worker node starts, you should see:
 
 ```
-Worker started (Fedify queue + Import worker + Cleanup worker + Remote reply scrape worker)
+Worker started (Fedify activity/task queues + Job recovery)
 ```
 
 Watch for messages about processing activities, imports, cleanups, and remote
@@ -307,8 +410,10 @@ Performance considerations
     activity (1GB-2GB RAM recommended)
  -  *Database*: Shared by all nodes; ensure it has adequate resources
     (2GB+ RAM recommended for busy instances)
- -  *Concurrency*: Each worker processes up to 10 messages concurrently
-    (configured via `ParallelMessageQueue`)
+ -  *Concurrency*: Each worker processes up to 10 ActivityPub messages and
+    four application tasks concurrently on separate queues. Remote replies
+    scraping uses at most two of those four task slots. These limits apply
+    per worker process; adding workers increases total concurrency.
 
 
 Best practices

@@ -55,8 +55,9 @@ describe("transformPostHtmlWithGukhanmun", () => {
     );
   });
 
-  it("adds North Korean readings to matching HTML", async () => {
+  it("adds North Korean readings with the North Korean dictionary", async () => {
     vi.stubEnv("GUKHANMUN", "ko,ko-*");
+    vi.stubEnv("GUKHANMUN_DICTS", "loanwords,opendict:north-korean,stdict");
 
     await expect(
       transformPostHtmlWithGukhanmun("<p>來日</p>", "ko-KP"),
@@ -65,6 +66,45 @@ describe("transformPostHtmlWithGukhanmun", () => {
     );
   });
 
+  it("honors dictionary order when the configuration changes", async () => {
+    vi.stubEnv("GUKHANMUN", "ko");
+    for (const [dictionaries, reading] of [
+      ["loanwords,stdict", "홍콩"],
+      ["stdict,loanwords", "샹강"],
+      ["loanwords,stdict", "홍콩"],
+    ]) {
+      vi.stubEnv("GUKHANMUN_DICTS", dictionaries);
+      await expect(
+        transformPostHtmlWithGukhanmun("<p>香港</p>", "ko"),
+      ).resolves.toBe(
+        `<p><ruby>香港<rp>(</rp><rt>${reading}</rt><rp>)</rp></ruby></p>`,
+      );
+    }
+  });
+
+  it("uses the default dictionaries without adding North Korean entries", async () => {
+    vi.stubEnv("GUKHANMUN", "ko-*");
+    vi.stubEnv("GUKHANMUN_DICTS", undefined);
+    await expect(
+      transformPostHtmlWithGukhanmun("<p>來日</p>", "ko-KP"),
+    ).resolves.toBe(
+      "<p><ruby>來日<rp>(</rp><rt>내일</rt><rp>)</rp></ruby></p>",
+    );
+  });
+
+  it.each(["ko-KR", "ko-KP"])(
+    "prefers loanword spellings over the preset dictionary for %s",
+    async (locale) => {
+      vi.stubEnv("GUKHANMUN", "ko,ko-*");
+
+      await expect(
+        transformPostHtmlWithGukhanmun("<p>香港</p>", locale),
+      ).resolves.toBe(
+        "<p><ruby>香港<rp>(</rp><rt>홍콩</rt><rp>)</rp></ruby></p>",
+      );
+    },
+  );
+
   it.each([
     ["South Korean", "ko-KR", "내일"],
     ["North Korean", "ko-KP", "래일"],
@@ -72,6 +112,12 @@ describe("transformPostHtmlWithGukhanmun", () => {
     "preserves translate=no regions with %s readings",
     async (_name, locale, reading) => {
       vi.stubEnv("GUKHANMUN", "ko,ko-*");
+      vi.stubEnv(
+        "GUKHANMUN_DICTS",
+        locale === "ko-KP"
+          ? "loanwords,opendict:north-korean,stdict"
+          : "loanwords,stdict",
+      );
       const html =
         '<p><a href="https://example.com/@x" translate="no" ' +
         'class="h-card u-url mention">@<span>來日</span></a>와 來日</p>';
@@ -96,5 +142,20 @@ describe("transformPostHtmlWithGukhanmun", () => {
     await expect(
       transformPostHtmlWithGukhanmun("<p>漢字</p>", "ja"),
     ).resolves.toBe("<p>漢字</p>");
+  });
+
+  it("preserves authored ruby, math, and literal math fallbacks", async () => {
+    vi.stubEnv("GUKHANMUN", "ko");
+    const preserved =
+      '<ruby class="hollo-markdown-preserve">漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>' +
+      '<math class="hollo-math hollo-markdown-preserve"><semantics><mtext>漢字</mtext><annotation encoding="application/x-tex">\\text{漢字}</annotation></semantics></math>' +
+      '<span class="hollo-math hollo-markdown-preserve">$漢字$</span>' +
+      '<div class="hollo-math hollo-markdown-preserve">$$漢字$$</div>';
+
+    await expect(
+      transformPostHtmlWithGukhanmun(preserved + "<p>漢字</p>", "ko"),
+    ).resolves.toBe(
+      preserved + "<p><ruby>漢字<rp>(</rp><rt>한자</rt><rp>)</rp></ruby></p>",
+    );
   });
 });

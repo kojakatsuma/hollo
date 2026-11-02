@@ -23,10 +23,7 @@ import {
 import { getPostRelations, serializePost } from "../../entities/status";
 import federation from "../../federation";
 import { updateAccountStats } from "../../federation/account";
-import {
-  getQuoteAuthorizationIri,
-  sendQuoteUpdate,
-} from "../../federation/inbox";
+import { sendQuoteUpdate } from "../../federation/inbox";
 import {
   getRecipients,
   persistPost,
@@ -37,6 +34,11 @@ import {
   toUpdate,
   updatePostStats,
 } from "../../federation/post";
+import {
+  createQuoteAuthorization,
+  createQuoteRequest,
+  getQuoteAuthorizationIri,
+} from "../../federation/quote";
 import { appendPostToTimelines } from "../../federation/timeline";
 import { requestBody } from "../../helpers";
 import { isLocalHost } from "../../instance-host";
@@ -48,6 +50,7 @@ import {
   withAccountOwner,
 } from "../../oauth/middleware";
 import { normalizeHandle } from "../../patterns";
+import { enqueuePollNotification } from "../../poll-notification-tasks";
 import { fetchPreviewCard, type PreviewCard } from "../../previewcard";
 import {
   type AccountOwner,
@@ -421,7 +424,11 @@ app.post(
     const content =
       data.status == null
         ? null
-        : await formatPostContent(db, data.status, language, fmtOpts);
+        : await formatPostContent(db, data.status, language, {
+            ...fmtOpts,
+            documentId: id,
+            permalink: url.href,
+          });
     const summary =
       data.spoiler_text == null || data.spoiler_text.trim() === ""
         ? null
@@ -601,6 +608,9 @@ app.post(
       where: { id: { eq: id } },
       with: getPostRelations(owner.id),
     }))!;
+    if (post.pollId != null) {
+      await enqueuePollNotification(db, post.pollId, fedCtx.url);
+    }
     const activity = toCreate(post, fedCtx);
     const orderingKey = getPostOrderingKey(post.iri);
     await fedCtx.sendActivity(
@@ -632,14 +642,12 @@ app.post(
                   sharedInbox: new URL(post.quoteTarget.account.sharedInboxUrl),
                 },
         },
-        new vocab.QuoteRequest({
-          id: new URL("#quote-request", post.iri),
-          actor: new URL(owner.account.iri),
-          object: new URL(post.quoteTarget.iri),
-          instrument: toObject(post, fedCtx, {
-            includeInactiveQuoteTarget: true,
-          }),
-        }),
+        createQuoteRequest(
+          post,
+          owner.account.iri,
+          post.quoteTarget.iri,
+          toObject(post, fedCtx, { includeInactiveQuoteTarget: true }),
+        ),
         {
           orderingKey,
           preferSharedInbox: true,
@@ -671,6 +679,12 @@ app.put(
       return c.json({ error: "invalid_request", zod_error: result.error }, 422);
     }
 
+    const existingPost = await db.query.posts.findFirst({
+      where: { id: { eq: id }, accountId: { eq: owner.id } },
+    });
+    if (existingPost == null) {
+      return c.json({ error: "Record not found" }, 404);
+    }
     const data = result.data;
 
     const fedCtx = federation.createContext(c.req.raw, undefined);
@@ -686,7 +700,11 @@ app.put(
     const content =
       data.status == null
         ? null
-        : await formatPostContent(db, data.status, language, fmtOpts);
+        : await formatPostContent(db, data.status, language, {
+            ...fmtOpts,
+            documentId: id,
+            permalink: existingPost.url ?? existingPost.iri,
+          });
     const summary =
       data.spoiler_text == null || data.spoiler_text.trim() === ""
         ? null
@@ -703,12 +721,6 @@ app.put(
     let previewCard: PreviewCard | null = null;
     if (content?.previewLink != null) {
       previewCard = await fetchPreviewCard(content.previewLink);
-    }
-    const existingPost = await db.query.posts.findFirst({
-      where: { id: { eq: id }, accountId: { eq: owner.id } },
-    });
-    if (existingPost == null) {
-      return c.json({ error: "Record not found" }, 404);
     }
     const mediaIds = data.media_ids;
     const mediaIdSet = mediaIds == null ? null : new Set(mediaIds);
@@ -955,12 +967,14 @@ app.delete(
     const id = c.req.param("id");
     if (!isUuid(id)) return c.json({ error: "Record not found" }, 404);
     const post = await db.query.posts.findFirst({
-      where: { id: { eq: id } },
+      where: { id: { eq: id }, accountId: { eq: owner.id } },
       with: getPostRelations(owner.id),
     });
     if (post == null) return c.json({ error: "Record not found" }, 404);
     await db.transaction(async (tx) => {
-      await tx.delete(posts).where(eq(posts.id, id));
+      await tx
+        .delete(posts)
+        .where(and(eq(posts.id, id), eq(posts.accountId, owner.id)));
       if (
         post.quoteTargetId != null &&
         (post.quoteState == null || post.quoteState === "accepted")
@@ -1976,12 +1990,13 @@ app.post(
         new vocab.Delete({
           id: new URL("#delete", quoteAuthorizationIri),
           actor: new URL(owner.account.iri),
-          object: new vocab.QuoteAuthorization({
-            id: new URL(quoteAuthorizationIri),
-            attribution: new URL(owner.account.iri),
-            interactingObject: new URL(quotingPost.iri),
-            interactionTarget: new URL(targetPost.iri),
-          }),
+          // Keep the embedded authorization instead of the helper's
+          // IRI-only revocation so the wire format stays unchanged.
+          object: createQuoteAuthorization(
+            { iri: targetPost.iri, account: owner.account },
+            quotingPost,
+            quoteAuthorizationIri,
+          ),
         }),
         {
           orderingKey: getPostOrderingKey(quotingPost.iri),

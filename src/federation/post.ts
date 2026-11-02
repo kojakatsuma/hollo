@@ -1,4 +1,5 @@
 import type { Context } from "@fedify/fedify";
+import { quoteInteraction } from "@fedify/interaction-controls";
 import * as vocab from "@fedify/vocab";
 import {
   type Announce,
@@ -19,7 +20,6 @@ import {
   lookupObject,
   Note,
   Question,
-  QuoteAuthorization,
   type Recipient,
   Source,
   Tombstone,
@@ -37,6 +37,8 @@ import { extractPreviewLink } from "../html";
 import { makeVideoScreenshot, type Thumbnail, uploadThumbnail } from "../media";
 import { orderMedia } from "../media-order";
 import { REMOTE_MEDIA_THUMBNAILS } from "../media-proxy";
+import { createNotification } from "../notification";
+import { enqueuePollNotification } from "../poll-notification-tasks";
 import { fetchPreviewCard } from "../previewcard";
 import {
   type Account,
@@ -67,6 +69,12 @@ import {
 } from "./account";
 import { toDate, toTemporalInstant } from "./date";
 import { toEmoji } from "./emoji";
+import { federation } from "./federation";
+import {
+  createQuoteTargetSubject,
+  getQuoteAuthorizationIri,
+  verifyQuoteAuthorization,
+} from "./quote";
 import { persistRemoteEmojiReactions } from "./reactions";
 import { enqueueRemoteReplyScrape } from "./replies";
 import { appendPostToTimelines } from "./timeline";
@@ -167,8 +175,29 @@ function getQuoteApprovalPolicy(
   return "nobody";
 }
 
+// Mastodon and Hollo send both `content` and `contentMap`, so after JSON-LD
+// expansion the singular `content` accessor returns the plain string rather
+// than the LanguageString; search all values instead.  Values tagged `und`
+// (e.g., from a context-level default `@language`) are skipped, and recent
+// engines report `undefined` instead of `"und"` as their language.  Titles
+// (`name`) are consulted last, and only when the post stores one:
+function getLanguage(object: ASPost, includeNames: boolean): string | null {
+  for (const value of [
+    ...object.contents,
+    ...object.summaries,
+    ...(includeNames ? object.names : []),
+  ]) {
+    if (!(value instanceof LanguageString)) continue;
+    const language = value.locale.language;
+    if (language == null || language === "und") continue;
+    return value.locale.toString();
+  }
+  return null;
+}
+
 async function getVerifiedQuoteAuthorizationIri(
   object: ASPost,
+  baseUrl: URL | string,
   quoteTargetIri: string | null,
   quoteTargetAccountIri: string | null,
   options: PersistAccountOptions,
@@ -182,18 +211,25 @@ async function getVerifiedQuoteAuthorizationIri(
   ) {
     return null;
   }
-  const authorization = await object.getQuoteAuthorization({
-    ...options,
-    crossOrigin: "trust",
-    suppressError: true,
-  });
-  if (!(authorization instanceof QuoteAuthorization)) return null;
-  if (authorization.id?.href !== authorizationId.href) return null;
-  if (authorization.attributionId?.href !== quoteTargetAccountIri) return null;
-  if (authorization.interactingObjectId?.href !== object.id.href) return null;
-  if (authorization.interactionTargetId?.href !== quoteTargetIri) return null;
-  return authorizationId.href;
+  // Only the authorization IRI is used: an embedded body is never trusted,
+  // so the helper dereferences it and checks its origin against the author.
+  const verification = await verifyQuoteAuthorization(
+    federation.createContext(new URL(baseUrl), undefined),
+    {
+      authorizationId,
+      quoteIri: object.id.href,
+      targetIri: quoteTargetIri,
+      targetAuthorIri: quoteTargetAccountIri,
+      documentLoader: options.documentLoader,
+    },
+  );
+  return verification.verified ? verification.authorizationIri : null;
 }
+
+type PersistedPost = Post & {
+  account: Account & { owner: AccountOwner | null };
+  mentions: Mention[];
+};
 
 export async function persistPost(
   db: DatabaseLike,
@@ -203,7 +239,12 @@ export async function persistPost(
     account?: Account & { owner: AccountOwner | null };
     enqueueRemoteReplies?: boolean;
     fetchEmojiReactions?: boolean;
+    fetchReplyTarget?: boolean;
+    postAncestry?: ReadonlySet<string>;
     replyTarget?: Post;
+    persistPrepared?: (
+      write: (db: DatabaseLike) => Promise<PersistedPost | null>,
+    ) => Promise<PersistedPost | null>;
   } = {},
 ): Promise<
   | (Post & {
@@ -221,6 +262,11 @@ export async function persistPost(
   if (existingPost != null && existingPost.account.owner != null) {
     return existingPost;
   }
+  if (options.postAncestry?.has(object.id.href)) return existingPost ?? null;
+  options = {
+    ...options,
+    postAncestry: new Set([...(options.postAncestry ?? []), object.id.href]),
+  };
   const publishedRaw = toDate(object.published);
   const updatedRaw = toDate(object.updated);
   const now = Date.now();
@@ -258,16 +304,17 @@ export async function persistPost(
       replyTargetId = options.replyTarget.id;
     } else {
       const result = await db
-        .select({ id: posts.id })
+        .select()
         .from(posts)
         .where(eq(posts.iri, object.replyTargetId.href))
         .limit(1);
       if (result != null && result.length > 0) {
         replyTargetId = result[0].id;
+        replyTargetObj = result[0];
         logger.debug("The reply target is already persisted: {replyTargetId}", {
           replyTargetId,
         });
-      } else {
+      } else if (options.fetchReplyTarget !== false) {
         logger.debug("Persisting the reply target...");
         const replyTarget = await object.getReplyTarget(options);
         if (isPost(replyTarget)) {
@@ -331,6 +378,9 @@ export async function persistPost(
   let quoteTargetIri: string | null = null;
   let quoteTargetAccountId: Uuid | null = null;
   let quoteTargetAccountIri: string | null = null;
+  let localQuoteTarget:
+    | (Post & { account: Account & { owner: AccountOwner | null } })
+    | null = null;
   if (objectLink == null && object.quoteId != null) {
     objectLink = object.quoteId;
   }
@@ -341,18 +391,24 @@ export async function persistPost(
     quoteTargetIri = objectLink.href;
     const found = await db.query.posts.findFirst({
       where: { iri: { eq: objectLink.href } },
-      with: { account: true },
+      with: { account: { with: { owner: true } } },
     });
     if (found != null) {
       quoteTargetId = found.id;
       quoteTargetAccountId = found.accountId;
       quoteTargetAccountIri = found.account.iri;
+      if (found.account.owner != null && found.sharingId == null) {
+        localQuoteTarget = found;
+      }
       logger.debug("The quote target is already persisted: {quoteTargetId}", {
         quoteTargetId,
       });
     } else {
       logger.debug("Persisting the quote target...");
-      const quoteTarget = await lookupObject(objectLink, options);
+      const quoteTarget =
+        options.objectLoader == null
+          ? await lookupObject(objectLink, options)
+          : await options.objectLoader(objectLink);
       if (isPost(quoteTarget)) {
         const quoteTargetObj = await persistPost(db, quoteTarget, baseUrl, {
           ...options,
@@ -378,24 +434,89 @@ export async function persistPost(
       : await extractPreviewLink(
           object.content.toString(),
           previewLinkExclusions,
+          [
+            object.id?.href,
+            object.url instanceof Link
+              ? object.url.href?.href
+              : object.url?.href,
+          ].filter((value): value is string => value != null),
         );
   const previewCard =
     previewLink == null ? null : await fetchPreviewCard(previewLink);
-  const quoteAuthorizationIri = await getVerifiedQuoteAuthorizationIri(
-    object,
-    quoteTargetIri,
-    quoteTargetAccountIri,
-    options,
-  );
+  const sameQuoteTarget =
+    existingPost != null &&
+    ((quoteTargetId != null && existingPost.quoteTargetId === quoteTargetId) ||
+      (quoteTargetIri != null &&
+        existingPost.quoteTargetIri === quoteTargetIri));
+  const preserveRevokedQuote =
+    sameQuoteTarget && existingPost?.quoteState === "revoked";
+  const quoteAuthorizationIri = preserveRevokedQuote
+    ? null
+    : await getVerifiedQuoteAuthorizationIri(
+        object,
+        baseUrl,
+        quoteTargetIri,
+        quoteTargetAccountIri,
+        options,
+      );
   const preserveAcceptedQuote =
-    quoteTargetIri != null &&
-    existingPost?.quoteState === "accepted" &&
-    existingPost.quoteTargetIri === quoteTargetIri;
-  const preservedQuoteAuthorizationIri =
-    quoteAuthorizationIri ??
-    (preserveAcceptedQuote ? existingPost.quoteAuthorizationIri : null);
+    sameQuoteTarget && existingPost?.quoteState === "accepted";
+  let acceptImpoliteQuote = false;
+  if (
+    !preserveRevokedQuote &&
+    !preserveAcceptedQuote &&
+    quoteAuthorizationIri == null &&
+    account.owner == null &&
+    object.id.origin === new URL(account.iri).origin &&
+    localQuoteTarget != null &&
+    (localQuoteTarget.quoteApprovalPolicy ?? "public") === "public" &&
+    (localQuoteTarget.visibility === "public" ||
+      localQuoteTarget.visibility === "unlisted")
+  ) {
+    const block = await db.query.blocks.findFirst({
+      where: {
+        RAW: (blocks, { and, eq, or }) =>
+          or(
+            and(
+              eq(blocks.accountId, localQuoteTarget.accountId),
+              eq(blocks.blockedAccountId, account.id),
+            ),
+            and(
+              eq(blocks.accountId, account.id),
+              eq(blocks.blockedAccountId, localQuoteTarget.accountId),
+            ),
+          )!,
+      },
+    });
+    if (block == null) {
+      const ctx = federation.createContext(new URL(baseUrl), undefined);
+      const decision = await quoteInteraction.evaluatePolicy(ctx, {
+        subject: createQuoteTargetSubject(
+          localQuoteTarget,
+          getCanQuoteRule(localQuoteTarget, ctx),
+        ),
+        requester: new URL(account.iri),
+      });
+      acceptImpoliteQuote =
+        decision.result === "automatic" && decision.reason.type === "public";
+    }
+  }
   const published = publishedRaw;
   const updated = updatedRaw ?? published ?? new Date();
+  const postId =
+    existingPost?.id ?? uuidv7(Math.max(0, +(published ?? updated)));
+  const preservedQuoteAuthorizationIri = preserveRevokedQuote
+    ? null
+    : (quoteAuthorizationIri ??
+      (preserveAcceptedQuote
+        ? existingPost.quoteAuthorizationIri
+        : acceptImpoliteQuote && localQuoteTarget != null
+          ? getQuoteAuthorizationIri(localQuoteTarget, { id: postId })
+          : null));
+  // Only Articles carry a title; other types may use `name` for unrelated
+  // purposes (e.g., poll options), so it is ignored for them:
+  const name =
+    object instanceof Article ? object.name?.toString().trim() || null : null;
   const values = {
     type:
       object instanceof Question
@@ -409,12 +530,14 @@ export async function persistPost(
     sharingId: null,
     quoteTargetId,
     quoteTargetIri,
-    quoteState:
-      quoteTargetId == null
+    quoteState: preserveRevokedQuote
+      ? "revoked"
+      : quoteTargetId == null
         ? null
         : quoteTargetAccountId === account.id ||
             quoteAuthorizationIri != null ||
-            preserveAcceptedQuote
+            preserveAcceptedQuote ||
+            acceptImpoliteQuote
           ? "accepted"
           : "unauthorized",
     quoteAuthorizationIri: preservedQuoteAuthorizationIri,
@@ -425,14 +548,10 @@ export async function persistPost(
         : account.followersUrl != null && to.has(account.followersUrl)
           ? "private"
           : "direct",
+    name,
     summary: object.summary?.toString(),
     contentHtml: object.content?.toString(),
-    language:
-      object.content instanceof LanguageString
-        ? object.content.locale.toString()
-        : object.summary instanceof LanguageString
-          ? object.summary.locale.toString()
-          : null,
+    language: getLanguage(object, name != null),
     previewCard,
     tags,
     emojis,
@@ -444,140 +563,136 @@ export async function persistPost(
     published,
     updated,
   } as const;
-  await db
-    .insert(posts)
-    .values({
-      ...values,
-      repliesCount: existingPost?.repliesCount ?? 0,
-      id: uuidv7(Math.max(0, +(published ?? updated))),
-      iri: object.id.href,
-    })
-    .onConflictDoUpdate({
-      target: [posts.iri],
-      set: values,
-      setWhere: eq(posts.iri, object.id.href),
-    });
-  let post = await db.query.posts.findFirst({
-    where: { iri: { eq: object.id.href } },
-  });
-  if (post == null) return null;
-  if (
-    options.fetchEmojiReactions !== false &&
-    account.owner == null &&
-    (object instanceof Note ||
-      object instanceof Question ||
-      object instanceof Article)
-  ) {
-    const emojiReactions = await object.getEmojiReactions({
-      ...options,
-      crossOrigin: "trust",
-      suppressError: true,
-    });
-    if (emojiReactions != null) {
-      await persistRemoteEmojiReactions(
-        db,
-        emojiReactions,
-        {
-          ...post,
-          account,
+  // Read moderation state from the conflicting row, not just the snapshot
+  // above: an approval or revocation may arrive during remote fetches.
+  const sameStoredTarget = sql`(
+    (${quoteTargetId}::uuid IS NOT NULL AND ${posts.quoteTargetId} = ${quoteTargetId}::uuid)
+    OR (${quoteTargetIri}::text IS NOT NULL AND ${posts.quoteTargetIri} = ${quoteTargetIri}::text)
+  )`;
+  const storedRevoked = sql`${sameStoredTarget} AND ${posts.quoteState} = 'revoked'`;
+  const storedAccepted = sql`${sameStoredTarget} AND ${posts.quoteState} = 'accepted'`;
+  const impoliteAuthorization =
+    acceptImpoliteQuote && localQuoteTarget != null
+      ? sql`${localQuoteTarget.iri + "/quote_authorizations/"}::text || ${posts.id}::text`
+      : sql`NULL::text`;
+
+  const postIri = object.id.href;
+  const persistValues = async (database: DatabaseLike) => {
+    // Keep the acceptance transition and its notification in one short
+    // transaction. Network/media work remains outside it, so a retry after
+    // a failed attachment fetch cannot lose the notification.
+    const previous =
+      localQuoteTarget == null
+        ? existingPost
+        : (
+            await database
+              .select({
+                quoteTargetId: posts.quoteTargetId,
+                quoteState: posts.quoteState,
+              })
+              .from(posts)
+              .where(eq(posts.iri, postIri))
+              .for("update")
+          )[0];
+    const inserted = await database
+      .insert(posts)
+      .values({
+        ...values,
+        repliesCount: existingPost?.repliesCount ?? 0,
+        id: postId,
+        iri: postIri,
+      })
+      .onConflictDoUpdate({
+        target: [posts.iri],
+        set: {
+          ...values,
+          quoteState: sql`CASE
+          WHEN ${storedRevoked} THEN 'revoked'::quote_state
+          WHEN ${quoteTargetId}::uuid IS NULL THEN NULL
+          WHEN ${storedAccepted} THEN 'accepted'::quote_state
+          ELSE ${values.quoteState}::quote_state END`,
+          quoteAuthorizationIri: sql`CASE
+          WHEN ${storedRevoked} THEN NULL
+          WHEN ${quoteAuthorizationIri}::text IS NOT NULL THEN ${quoteAuthorizationIri}::text
+          WHEN ${storedAccepted} THEN ${posts.quoteAuthorizationIri}
+          ELSE ${impoliteAuthorization} END`,
         },
-        baseUrl,
-        options,
+        setWhere: options.skipUpdate ? sql`false` : eq(posts.iri, postIri),
+      })
+      .returning({ id: posts.id });
+    if (options.skipUpdate && inserted.length === 0) return undefined;
+    const post = await database.query.posts.findFirst({
+      where: { iri: { eq: postIri } },
+    });
+
+    if (post == null) return undefined;
+    for (const targetId of new Set([
+      previous?.quoteTargetId,
+      post.quoteTargetId,
+    ])) {
+      if (targetId != null) await updatePostStats(database, { id: targetId });
+    }
+    if (
+      localQuoteTarget?.account.owner != null &&
+      post.quoteTargetId === localQuoteTarget.id &&
+      post.quoteState === "accepted" &&
+      account.id !== localQuoteTarget.accountId &&
+      (previous?.quoteTargetId !== post.quoteTargetId ||
+        (previous.quoteState != null && previous.quoteState !== "accepted"))
+    ) {
+      await createNotification(
+        {
+          accountOwnerId: localQuoteTarget.account.owner.id,
+          type: "quote",
+          actorAccountId: account.id,
+          targetPostId: post.id,
+        },
+        database,
       );
     }
+    return post;
+  };
+  // Ordinary inbox callers retain the post and quote notification if later
+  // media transport fails. Only scrape callers require complete atomic items.
+  const earlyPost =
+    options.persistPrepared == null
+      ? localQuoteTarget == null
+        ? await persistValues(db)
+        : await db.transaction(persistValues)
+      : undefined;
+  if (options.persistPrepared == null && earlyPost == null) {
+    if (!options.skipUpdate) return null;
+    return (
+      (await db.query.posts.findFirst({
+        where: { iri: { eq: postIri } },
+        with: { account: { with: { owner: true } }, mentions: true },
+      })) ?? null
+    );
   }
+
+  // Resolve poll options and attachment transport before the write phase.
+  // Scrape workers can then fence and commit complete items without holding
+  // database locks while waiting for a remote server or a pacing slot.
+  const choices: [string, number][] = [];
+  let multiple = false;
   if (object instanceof Question) {
-    const options: [string, number][] = [];
-    let multiple = false;
-    for await (const option of object.getExclusiveOptions()) {
+    for await (const option of object.getExclusiveOptions(options)) {
       if (option instanceof Note && option.name != null) {
-        const replies = await option.getReplies();
-        options.push([option.name.toString(), replies?.totalItems ?? 0]);
+        const replies = await option.getReplies(options);
+        choices.push([option.name.toString(), replies?.totalItems ?? 0]);
       }
     }
-    if (options.length < 1) {
-      for await (const option of object.getInclusiveOptions()) {
+    if (choices.length < 1) {
+      for await (const option of object.getInclusiveOptions(options)) {
         if (option instanceof Note && option.name != null) {
-          const replies = await option.getReplies();
-          options.push([option.name.toString(), replies?.totalItems ?? 0]);
+          const replies = await option.getReplies(options);
+          choices.push([option.name.toString(), replies?.totalItems ?? 0]);
         }
         multiple = true;
       }
     }
-    if (options.length > 0 && object.endTime != null) {
-      if (post.pollId == null) {
-        const [poll] = await db
-          .insert(polls)
-          .values({
-            id: uuidv7(),
-            multiple,
-            votersCount: object.voters ?? 0,
-            expires: toDate(object.endTime),
-          })
-          .returning();
-        await db.insert(pollOptions).values(
-          options.map(([title, votesCount], index) => ({
-            pollId: poll.id,
-            index,
-            title,
-            votesCount,
-          })),
-        );
-        await db
-          .update(posts)
-          .set({ pollId: poll.id })
-          .where(eq(posts.id, post.id));
-      } else {
-        const [poll] = await db
-          .update(polls)
-          .set({
-            multiple,
-            votersCount: object.voters ?? 0,
-            expires: toDate(object.endTime),
-          })
-          .where(eq(polls.id, post.pollId))
-          .returning();
-        for (let index = 0; index < options.length; index++) {
-          const [title, votesCount] = options[index];
-          await db
-            .insert(pollOptions)
-            .values({ pollId: poll.id, index, title, votesCount })
-            .onConflictDoUpdate({
-              target: [pollOptions.pollId, pollOptions.index],
-              set: { title, votesCount },
-              setWhere: and(
-                eq(pollOptions.pollId, poll.id),
-                eq(pollOptions.index, index),
-              ),
-            });
-        }
-        await db
-          .delete(pollOptions)
-          .where(
-            and(
-              eq(pollOptions.pollId, post.pollId),
-              gte(pollOptions.index, options.length),
-            ),
-          );
-      }
-    }
   }
-  const mentionRows: Mention[] = [];
-  await db.delete(mentions).where(eq(mentions.postId, post.id));
-  for (const account of mentionedAccounts.values()) {
-    const result = await db
-      .insert(mentions)
-      .values({
-        accountId: account.id,
-        postId: post.id,
-      })
-      .onConflictDoNothing({
-        target: [mentions.accountId, mentions.postId],
-      })
-      .returning();
-    mentionRows.push(...result);
-  }
-  await db.delete(media).where(eq(media.postId, post.id));
+  const preparedMedia: Omit<NewMedium, "postId">[] = [];
   let mediaPosition = 0;
   for await (const attachment of object.getAttachments(options)) {
     if (
@@ -677,9 +792,8 @@ export async function persistPost(
         thumbnailHeight: metadata.height!,
       };
     }
-    await db.insert(media).values({
+    preparedMedia.push({
       id,
-      postId: post.id,
       position: mediaPosition,
       type: mediaType,
       url,
@@ -688,32 +802,168 @@ export async function persistPost(
       width: attachment.width ?? metadata.width!,
       height: attachment.height ?? metadata.height!,
       ...thumbnail,
-    } satisfies NewMedium);
+    } satisfies Omit<NewMedium, "postId">);
     mediaPosition++;
   }
-  post = await db.query.posts.findFirst({
-    where: { iri: { eq: object.id.href } },
-    with: { account: true, media: true },
-  });
-  if (post == null) return null;
-  if (
-    options.enqueueRemoteReplies !== false &&
-    account.owner == null &&
-    repliesIri != null
-  ) {
-    await enqueueRemoteReplyScrape(db, {
-      baseUrl,
-      post,
-      repliesIri,
+
+  const writePrepared = async (
+    db: DatabaseLike,
+  ): Promise<PersistedPost | null> => {
+    let post =
+      earlyPost ??
+      (localQuoteTarget == null
+        ? await persistValues(db)
+        : await db.transaction(persistValues));
+    if (post == null) {
+      if (!options.skipUpdate) return null;
+      return (
+        (await db.query.posts.findFirst({
+          where: { iri: { eq: postIri } },
+          with: { account: { with: { owner: true } }, mentions: true },
+        })) ?? null
+      );
+    }
+    if (
+      options.fetchEmojiReactions !== false &&
+      account.owner == null &&
+      (object instanceof Note ||
+        object instanceof Question ||
+        object instanceof Article)
+    ) {
+      const emojiReactions = await object.getEmojiReactions({
+        ...options,
+        crossOrigin: "trust",
+        suppressError: true,
+      });
+      if (emojiReactions != null) {
+        await persistRemoteEmojiReactions(
+          db,
+          emojiReactions,
+          {
+            ...post,
+            account,
+          },
+          baseUrl,
+          options,
+        );
+      }
+    }
+    let rescheduledPollId: Uuid | undefined;
+    if (object instanceof Question) {
+      if (choices.length > 0 && object.endTime != null) {
+        if (post.pollId == null) {
+          const [poll] = await db
+            .insert(polls)
+            .values({
+              id: uuidv7(),
+              multiple,
+              votersCount: object.voters ?? 0,
+              expires: toDate(object.endTime),
+            })
+            .returning();
+          await db.insert(pollOptions).values(
+            choices.map(([title, votesCount], index) => ({
+              pollId: poll.id,
+              index,
+              title,
+              votesCount,
+            })),
+          );
+          await db
+            .update(posts)
+            .set({ pollId: poll.id })
+            .where(eq(posts.id, post.id));
+        } else {
+          const previousPoll = await db.query.polls.findFirst({
+            where: { id: { eq: post.pollId } },
+          });
+          const [poll] = await db
+            .update(polls)
+            .set({
+              multiple,
+              votersCount: object.voters ?? 0,
+              expires: toDate(object.endTime),
+            })
+            .where(eq(polls.id, post.pollId))
+            .returning();
+          if (previousPoll == null || +previousPoll.expires !== +poll.expires) {
+            rescheduledPollId = poll.id;
+          }
+          for (let index = 0; index < choices.length; index++) {
+            const [title, votesCount] = choices[index];
+            await db
+              .insert(pollOptions)
+              .values({ pollId: poll.id, index, title, votesCount })
+              .onConflictDoUpdate({
+                target: [pollOptions.pollId, pollOptions.index],
+                set: { title, votesCount },
+                setWhere: and(
+                  eq(pollOptions.pollId, poll.id),
+                  eq(pollOptions.index, index),
+                ),
+              });
+          }
+          await db
+            .delete(pollOptions)
+            .where(
+              and(
+                eq(pollOptions.pollId, post.pollId),
+                gte(pollOptions.index, choices.length),
+              ),
+            );
+        }
+      }
+    }
+    const mentionRows: Mention[] = [];
+    await db.delete(mentions).where(eq(mentions.postId, post.id));
+    for (const account of mentionedAccounts.values()) {
+      const result = await db
+        .insert(mentions)
+        .values({
+          accountId: account.id,
+          postId: post.id,
+        })
+        .onConflictDoNothing({
+          target: [mentions.accountId, mentions.postId],
+        })
+        .returning();
+      mentionRows.push(...result);
+    }
+    await db.delete(media).where(eq(media.postId, post.id));
+    for (const medium of preparedMedia) {
+      await db.insert(media).values({ ...medium, postId: post.id });
+    }
+    post = await db.query.posts.findFirst({
+      where: { iri: { eq: postIri } },
+      with: { account: true, media: true },
     });
-  }
-  await appendPostToTimelines(db, {
-    ...post,
-    sharing: null,
-    mentions: mentionRows,
-    replyTarget: replyTargetObj,
-  });
-  return { ...post, account, mentions: mentionRows };
+    if (post == null) return null;
+    if (
+      options.enqueueRemoteReplies !== false &&
+      account.owner == null &&
+      (repliesIri != null || object.contextIds[0] != null)
+    ) {
+      await enqueueRemoteReplyScrape(db, {
+        baseUrl,
+        post,
+        repliesIri,
+        contextIri: object.contextIds[0],
+      });
+    }
+    await appendPostToTimelines(db, {
+      ...post,
+      sharing: null,
+      mentions: mentionRows,
+      replyTarget: replyTargetObj,
+    });
+    if (rescheduledPollId != null) {
+      await enqueuePollNotification(db, rescheduledPollId, baseUrl);
+    }
+    return { ...post, account, mentions: mentionRows };
+  };
+  return options.persistPrepared == null
+    ? await writePrepared(db)
+    : await options.persistPrepared(writePrepared);
 }
 
 export async function persistSharingPost(
@@ -1063,6 +1313,9 @@ export function toObject(
     // For unlisted posts, include PUBLIC_COLLECTION in cc
     // For all other visibilities, cc is null
     cc: post.visibility === "unlisted" ? vocab.PUBLIC_COLLECTION : null,
+    // The title's own language is not stored, so it is not tagged with
+    // the post's language to avoid producing an incorrect nameMap:
+    name: post.type === "Article" ? post.name : null,
     summaries:
       post.summary == null
         ? []
@@ -1188,7 +1441,7 @@ export function toObject(
   });
 }
 
-function getCanQuoteRule(
+export function getCanQuoteRule(
   post: Post & { account: Account & { owner: AccountOwner | null } },
   ctx: Context<unknown>,
 ): InteractionRule {

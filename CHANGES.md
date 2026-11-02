@@ -6,26 +6,48 @@ Version 0.10.0
 
 To be released.
 
- -  Upgraded Fedify to 2.3.8.  Fedify 2.3 adds an outbound delivery circuit
-    breaker (enabled by default for queued outbox delivery),
-    `MessageQueue.getDepth()` support, OpenTelemetry metrics for
-    federation operations, `mapActorAlias()` for fixed-path actor
-    dispatchers, and significantly faster TypeScript type-checking of
-    dispatcher paths.
+ -  Upgraded Fedify to 2.4.5 to address a security vulnerability in SSRF
+    protection.  \[[GHSA-r48c-xx2h-fv4g]]
 
- -  Quotes awaiting FEP-044f approval now expose `quoteUrl` for compatibility
+ -  Quotes awaiting [FEP-044f] approval now expose `quoteUrl` for compatibility
     with older software when the original public or unlisted post explicitly
     allows automatic approval for everyone.  The `quote` field and generated
     fallback still wait for approval.  Rejection or revocation removes the
     reference through an `Update`; failed rejection updates can be retried
     without changing the quote state or counts.  [[#602]]
 
+ -  [FEP-044f] quote authorization now uses Fedify's
+    *@fedify/interaction-controls* package to build and verify quote
+    requests and authorizations and to evaluate local quote policies.
+    Verification is stricter in a few cases:  [[#635], [#641]]
+
+     -  Incoming `QuoteRequest` activities must have an `id` and an `actor`,
+        and their quote post's `quote` and `quoteUrl` must point to the same
+        post.  Invalid requests are ignored before the quote post is stored.
+     -  An embedded quote post from another origin is fetched from its own
+        server instead of being trusted.
+     -  A `QuoteAuthorization` from an `Accept` or from a remote quote post is
+        always fetched from its IRI.  Embedded authorization contents are not
+        trusted.  The authorization must be hosted on the same origin as the
+        quoted post's author.  If the authorization can't be fetched because
+        of a temporary failure, the `Accept` is retried later.
+     -  Outgoing `Accept` and `Reject` responses to quote requests now have
+        explicit IDs and address the requester in `to`.
+
+ -  Remote quotes without [FEP-044f] approval are now accepted when the local
+    target is public or unlisted, allows automatic quotes by everyone
+    (including the default policy), and neither account blocks the other.
+    Accepted quotes have a local authorization and appear in quote counts
+    and notifications.  Cached unauthorized quotes are reevaluated on later
+    updates; there is no backfill.  Revoked quotes retain their state on
+    updates for the same target, including remote targets.  [[#640], [#660]]
+
  -  Added WebP (`image/webp`) as an accepted format for profile avatar and
     banner image uploads.  Previously only JPEG, PNG, and GIF were accepted
     by both the Mastodon-compatible
     `PATCH /api/v1/accounts/update_credentials` endpoint and the admin
     account creation and editing forms, even though WebP is supported
-    elsewhere in Hollo.  [[#524], [#526] by naskya]
+    elsewhere in Hollo.  [[#524], [#526] by naskya\]
 
  -  Added [FEP-c0e0] `emojiReactions` collections to local ActivityPub
     `Note`, `Question`, and `Article` objects, exposing stored emoji
@@ -46,12 +68,30 @@ To be released.
     successor account at the top of the profile card and muting the old
     profile's visual treatment.
 
+ -  Limited pending poll notification messages to 100 across the shared task
+    queue, including delayed wakeups and retries. Repeated schedules coalesce,
+    earlier wakeups take priority at the limit, and deferred work is recovered
+    after expiry. Delayed poll schedules no longer allocate worker timers.
+    [[#653], [#663]]
+
+ -  Remote conversation backfill now reads [FEP-f228] `context` collections
+    through *@fedify/backfill* before falling back to `replies`.  Collection
+    aliases share durable jobs, and each seed's replies wait for the context
+    result.  Backfill preserves existing posts, restores available parent
+    links, and shares a per-attempt document-loader budget across traversal
+    and persistence.  Set `REMOTE_REPLIES_SCRAPE_MAX_REQUESTS` to tune that
+    budget (default: `200`).  [[#661], [#664]]
+
  -  Replaced the undocumented `SEONBI_URL` integration with the embedded
     [Gukhanmun] Node-API binding.  Set `GUKHANMUN` to a comma-separated list of
     locale patterns, such as `ko,ko-*`, to add Hangul readings to Hanja in
     matching local posts.  Patterns can contain `*` wildcards.  Posts with a
-    `KP` region subtag use North Korean readings.  Seonbi's broader punctuation
-    transformations are no longer applied.
+    `KP` region subtag use the North Korean conversion preset.  Select
+    dictionaries in priority order with `GUKHANMUN_DICTS`; the default is
+    `loanwords,opendict:general,opendict:dialect,stdict`.  `opendict` includes
+    all categories; put `opendict:north-korean` first in the list for North
+    Korean dictionary readings.  Seonbi's broader punctuation transformations
+    are no longer applied.
 
  -  Replaced the archived MinIO images in the Docker Compose example with
     RustFS and the official AWS CLI image.  The setup continues to create a
@@ -76,14 +116,245 @@ To be released.
     characters.  The endpoint requires no authentication, and the value was
     previously stored unbounded and shown on the admin dashboard.
 
+ -  Titles of incoming ActivityPub `Article` objects, such as posts from
+    blogging platforms, are now preserved instead of being dropped.  The title
+    is shown as a heading above the post body on Hollo's web pages, and
+    Mastodon-compatible clients receive it as an `<h2>` heading prepended to
+    the status `content`.  Articles received before this change get their
+    titles when they are updated by their author or refreshed.  [[#646], [#650]]
+
+ -  Import and cleanup jobs now run through a dedicated Fedify task queue,
+    with bounded concurrency, durable retries, cancellation, and recovery
+    after interrupted processing or failed dispatch.  Proxy-cache enumeration
+    saves bounded batches without duplicating deletion items on retry.
+    Stop older nodes before migrating, then deploy matching web and worker
+    versions.  [[#636], [#637], [#645]]
+
+ -  Remote replies scraping now runs through the shared Fedify task queue,
+    including delayed retry wakeups.  Durable job and host records retain
+    cooldown, request spacing, HTTP 429 backoff, and stale-attempt protection.
+    Bounded recovery repairs missed enqueues and interrupted jobs.  Stop older
+    nodes before upgrading and deploy compatible task definitions on all nodes.
+    [[#636], [#638], [#648]]
+
+ -  Poll expiry notifications now run as delayed Fedify tasks on the shared
+    task queue.  Handlers reload the current expiry and recipients, preserving
+    owner/poll deduplication and notification group counts.  Bounded recovery
+    repairs missed schedules and advances through backlogs after downtime.
+    Stop older nodes before upgrading and deploy compatible task definitions
+    on all nodes.  [[#636], [#639], [#649]]
+
+ -  Upgraded *@simplewebauthn/server* to 14.0.3 and
+    *@simplewebauthn/browser* to 14.0.0, refreshing the vendored browser
+    bundle to match.  The server release fixes two moderate-severity
+    vulnerabilities in attestation certificate revocation handling, and version
+    14 adds post-quantum ML-DSA passkey support on runtimes that provide the
+    algorithms.  \[[GHSA-2g3p-m8c9-hhwh], [GHSA-j3h4-m3m2-7p7j]]
+
+ -  Added opt-in Markdown extensions for local posts.  Set
+    `MARKDOWN_EXTENSIONS` to select footnotes, definition lists, subscripts,
+    superscripts, highlights, ruby annotations, insertions, abbreviations,
+    task lists, or math.  Existing posts retain their rendered content until
+    explicitly edited.  Remote software may simplify the resulting HTML.
+    [[#679], [#680]]
+
+ -  Changed the HTTP server to avoid buffering entire uploads and incoming
+    activities before handling them behind a reverse proxy.  Shutdown now waits
+    for active HTTP requests alongside background workers within the existing
+    30-second deadline.
+
+    Responses now avoid creating a web stream for strings and byte buffers
+    until one is needed.
+
+    Static files now support conditional requests with `ETag` and
+    `Last-Modified` validators.  Hidden files and symlinks pointing outside the
+    configured storage directory are no longer served.
+
+    Proxy mode now uses the first nonempty forwarded host and protocol in a
+    comma-separated list, and ignores invalid forwarded hosts in favor of the
+    original `Host` header.  Trusted proxies must overwrite client-supplied
+    forwarded headers.  [[#672], [#673]]
+
+ -  Updated the Docker image to Node.js 26.12.1.
+
+[GHSA-r48c-xx2h-fv4g]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-r48c-xx2h-fv4g
+[FEP-044f]: https://w3id.org/fep/044f
 [FEP-c0e0]: https://w3id.org/fep/c0e0
+[FEP-f228]: https://w3id.org/fep/f228
 [Gukhanmun]: https://gukhanmun.org/
 [RFC 6749]: https://datatracker.ietf.org/doc/html/rfc6749#section-3.3
+[GHSA-2g3p-m8c9-hhwh]: https://github.com/MasterKale/SimpleWebAuthn/security/advisories/GHSA-2g3p-m8c9-hhwh
+[GHSA-j3h4-m3m2-7p7j]: https://github.com/MasterKale/SimpleWebAuthn/security/advisories/GHSA-j3h4-m3m2-7p7j
 [#524]: https://github.com/fedify-dev/hollo/issues/524
 [#526]: https://github.com/fedify-dev/hollo/pull/526
 [#549]: https://github.com/fedify-dev/hollo/issues/549
 [#602]: https://github.com/fedify-dev/hollo/issues/602
 [#609]: https://github.com/fedify-dev/hollo/issues/609
+[#635]: https://github.com/fedify-dev/hollo/issues/635
+[#636]: https://github.com/fedify-dev/hollo/issues/636
+[#637]: https://github.com/fedify-dev/hollo/issues/637
+[#638]: https://github.com/fedify-dev/hollo/issues/638
+[#639]: https://github.com/fedify-dev/hollo/issues/639
+[#640]: https://github.com/fedify-dev/hollo/issues/640
+[#641]: https://github.com/fedify-dev/hollo/pull/641
+[#645]: https://github.com/fedify-dev/hollo/pull/645
+[#646]: https://github.com/fedify-dev/hollo/issues/646
+[#648]: https://github.com/fedify-dev/hollo/pull/648
+[#649]: https://github.com/fedify-dev/hollo/pull/649
+[#650]: https://github.com/fedify-dev/hollo/pull/650
+[#653]: https://github.com/fedify-dev/hollo/issues/653
+[#660]: https://github.com/fedify-dev/hollo/pull/660
+[#661]: https://github.com/fedify-dev/hollo/issues/661
+[#663]: https://github.com/fedify-dev/hollo/pull/663
+[#664]: https://github.com/fedify-dev/hollo/pull/664
+[#672]: https://github.com/fedify-dev/hollo/issues/672
+[#673]: https://github.com/fedify-dev/hollo/pull/673
+[#679]: https://github.com/fedify-dev/hollo/issues/679
+[#680]: https://github.com/fedify-dev/hollo/pull/680
+
+
+Version 0.9.25
+--------------
+
+Released on October 24, 2026.
+
+ -  Upgraded Fedify to 2.2.20 to address a security vulnerability in SSRF
+    protection.  [[GHSA-r48c-xx2h-fv4g]]
+ -  Updated the Docker image to Node.js 24.22.1, which fixes the
+    \[October 2026 Node.js security vulnerabilities].
+ -  Distrusted the [compromised eMudhra intermediate CAs] in
+    the Docker image's system certificate store, following [Debian's fix].
+    Updated the build tool mise to 2026.10.18, which also includes the
+    certificate fix for its bundled npm backend.  The Node.js 24.22.1
+    update also includes its own fix for the compromised intermediates.
+
+[compromised eMudhra intermediate CAs]: https://emudhra.we-have-a-problem.com/
+[Debian's fix]: https://bugs.debian.org/1151413
+
+
+Version 0.9.24
+--------------
+
+Released on October 17, 2026.
+
+ -  Fixed a security vulnerability where any authenticated user with the
+    `write:statuses` scope could delete another local account's post or a
+    cached remote post by its UUID and receive the deleted post's contents.
+    Status deletion now requires the post to belong to the account associated
+    with the access token.  [[GHSA-v2qh-w789-xxj6]]
+
+[GHSA-v2qh-w789-xxj6]: https://github.com/fedify-dev/hollo/security/advisories/GHSA-v2qh-w789-xxj6
+
+
+Version 0.9.23
+--------------
+
+Released on October 14, 2026.
+
+ -  Upgraded Fedify to 2.2.19, which fixes two security vulnerabilities:
+    inboxes accepting signed activities whose IDs had a different origin
+    from their actors, which let any remote actor have forged objects
+    trusted as if they came from another server and suppress the genuine
+    activity with the same ID as a duplicate, and key ownership checks
+    accepting a different actor's document when an actor ID redirected to
+    or served it, which let an attacker whose actor document was reached
+    through a victim's actor ID sign activities that passed authentication
+    as the victim's.  Keys cached under the weaker ownership check are
+    fetched and verified again after upgrading.
+    [[GHSA-4qhx-hhwf-8685], [GHSA-8863-8468-7hq7]]
+
+[GHSA-4qhx-hhwf-8685]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-4qhx-hhwf-8685
+[GHSA-8863-8468-7hq7]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-8863-8468-7hq7
+
+
+Version 0.9.22
+--------------
+
+Released on October 5, 2026.
+
+ -  Fixed the language of remote posts not being stored when they were
+    received from Mastodon, Hollo, or any other software that sends `content`
+    together with `contentMap`.  [[#647], [#659]]
+
+ -  Upgraded Fedify to 2.2.16, which normalizes BCP 47 extended language
+    subtags before parsing language tags.  Language-tagged strings with tags
+    like `zh-YUE`, which Mastodon uses for Cantonese, were previously dropped
+    because `Intl.Locale` rejects them; they are now kept with the canonical
+    tag (e.g., `yue`).  [[#647], [fedify-dev/fedify#1229], [#659]]
+
+[fedify-dev/fedify#1229]: https://github.com/fedify-dev/fedify/issues/1229
+[#647]: https://github.com/fedify-dev/hollo/issues/647
+[#659]: https://github.com/fedify-dev/hollo/pull/659
+
+
+Version 0.9.21
+--------------
+
+Released on October 1, 2026.
+
+ -  Upgraded Fedify to 2.2.15, which fixes a security vulnerability where
+    `Context.routeActivity()` authenticated the dereferenced activity but
+    routed the caller's unauthenticated copy, so an attacker who knew the `id`
+    of any dereferenceable activity could have the application's inbox
+    listeners process an activity with that `id` but with an actor, object,
+    and addressing of the attacker's choice, and the genuine activity could
+    then be dropped as a duplicate.  The verified fetched document is now the
+    one that gets queued, handed to listeners, and forwarded.
+    [[GHSA-39gj-rchc-q5m3]]
+
+ -  Fixed slow home, public, and list timeline queries on large databases by
+    checking the shared post directly when filtering muted or blocked authors.
+    [[#633], [#634]]
+
+[GHSA-39gj-rchc-q5m3]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-39gj-rchc-q5m3
+[#633]: https://github.com/fedify-dev/hollo/issues/633
+[#634]: https://github.com/fedify-dev/hollo/pull/634
+
+
+Version 0.9.20
+--------------
+
+Released on September 30, 2026.
+
+ -  Upgraded Fedify to 2.2.14, which fixes a security vulnerability where the
+    remote document loaders followed unbounded chains of alternate document
+    links, which could exhaust resources during remote key and document
+    resolution.  Alternate links now share the 20-hop limit and loop detection
+    with HTTP redirects, and preserve the caller's cancellation signal.
+    [[GHSA-97w4-f4rq-mgqm]]
+
+ -  Added indexes on the post foreign keys in `list_posts`, `timeline_posts`,
+    `remote_reply_scrape_jobs`, `notifications`, and `notification_groups` to
+    avoid full table scans during cascading post deletes.  On large
+    installations, run these commands before upgrading to avoid blocking
+    writes during the automatic migration.  Run each command separately,
+    outside a transaction:
+
+    ~~~~ sql
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS list_posts_post_id_index
+      ON public.list_posts (post_id);
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS timeline_posts_post_id_index
+      ON public.timeline_posts (post_id);
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS remote_reply_scrape_jobs_post_id_index
+      ON public.remote_reply_scrape_jobs (post_id);
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS notifications_target_post_id_index
+      ON public.notifications (target_post_id);
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS notification_groups_target_post_id_index
+      ON public.notification_groups (target_post_id);
+    ~~~~
+
+    The migration reuses existing indexes with these names after checking
+    their definitions and validity.  This includes indexes created for the
+    workaround in [#624].  If a concurrent build fails or is interrupted,
+    PostgreSQL can leave an invalid index behind.  Drop only the affected
+    index with `DROP INDEX CONCURRENTLY public.<index_name>` and retry its
+    creation command before upgrading.  An existing index with an unexpected
+    definition also causes the migration to fail; inspect it before replacing
+    it.  [[#624], [#626]]
+
+[GHSA-97w4-f4rq-mgqm]: https://github.com/fedify-dev/fedify/security/advisories/GHSA-97w4-f4rq-mgqm
+[#624]: https://github.com/fedify-dev/hollo/issues/624
+[#626]: https://github.com/fedify-dev/hollo/pull/626
 
 
 Version 0.9.19
@@ -775,7 +1046,6 @@ Released on May 20, 2026.
  -  Added Traditional Chinese (繁體中文; `zh-TW`) documentation.
 
 [Split-domain WebFinger guide]: https://docs.hollo.social/install/split-domain/
-[FEP-044f]: https://w3id.org/fep/044f
 [logfmt]: https://brandur.org/logfmt
 [@hollo@hollo.social]: https://hollo.social/@hollo
 [#67]: https://github.com/fedify-dev/hollo/issues/67
@@ -799,6 +1069,81 @@ Released on May 20, 2026.
 [#491]: https://github.com/fedify-dev/hollo/pull/491
 [#492]: https://github.com/fedify-dev/hollo/issues/492
 [#493]: https://github.com/fedify-dev/hollo/pull/493
+
+
+Version 0.8.17
+--------------
+
+Released on October 24, 2026.
+
+ -  Upgraded Fedify to 2.1.31 to address a security vulnerability in SSRF
+    protection.  [[GHSA-r48c-xx2h-fv4g]]
+ -  Updated the Docker image to Node.js 24.22.1, which fixes the
+    \[October 2026 Node.js security vulnerabilities].
+ -  Distrusted the [compromised eMudhra intermediate CAs] in
+    the Docker image's system certificate store, following [Debian's fix].
+    Updated the build tool mise to 2026.10.18, which also includes the
+    certificate fix for its bundled npm backend.  The Node.js 24.22.1
+    update also includes its own fix for the compromised intermediates.
+
+
+Version 0.8.16
+--------------
+
+Released on October 17, 2026.
+
+ -  Fixed a security vulnerability where any authenticated user with the
+    `write:statuses` scope could delete another local account's post or a
+    cached remote post by its UUID and receive the deleted post's contents.
+    Status deletion now requires the post to belong to the account associated
+    with the access token.  [[GHSA-v2qh-w789-xxj6]]
+
+
+Version 0.8.15
+--------------
+
+Released on October 14, 2026.
+
+ -  Upgraded Fedify to 2.1.30, which fixes two security vulnerabilities:
+    inboxes accepting signed activities whose IDs had a different origin
+    from their actors, which let any remote actor have forged objects
+    trusted as if they came from another server and suppress the genuine
+    activity with the same ID as a duplicate, and key ownership checks
+    accepting a different actor's document when an actor ID redirected to
+    or served it, which let an attacker whose actor document was reached
+    through a victim's actor ID sign activities that passed authentication
+    as the victim's.  Keys cached under the weaker ownership check are
+    fetched and verified again after upgrading.
+    [[GHSA-4qhx-hhwf-8685], [GHSA-8863-8468-7hq7]]
+
+
+Version 0.8.14
+--------------
+
+Released on October 1, 2026.
+
+ -  Upgraded Fedify to 2.1.26, which fixes a security vulnerability where
+    `Context.routeActivity()` authenticated the dereferenced activity but
+    routed the caller's unauthenticated copy, so an attacker who knew the `id`
+    of any dereferenceable activity could have the application's inbox
+    listeners process an activity with that `id` but with an actor, object,
+    and addressing of the attacker's choice, and the genuine activity could
+    then be dropped as a duplicate.  The verified fetched document is now the
+    one that gets queued, handed to listeners, and forwarded.
+    [[GHSA-39gj-rchc-q5m3]]
+
+
+Version 0.8.13
+--------------
+
+Released on September 30, 2026.
+
+ -  Upgraded Fedify to 2.1.25, which fixes a security vulnerability where the
+    remote document loaders followed unbounded chains of alternate document
+    links, which could exhaust resources during remote key and document
+    resolution.  Alternate links now share the 20-hop limit and loop detection
+    with HTTP redirects, and preserve the caller's cancellation signal.
+    [[GHSA-97w4-f4rq-mgqm]]
 
 
 Version 0.8.12

@@ -16,11 +16,13 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 
 import metadata from "../../package.json" with { type: "json" };
+import { registerBackgroundJobs } from "../background/jobs";
+import { PollMessageQueue } from "../background/poll-queue";
+import { TaskMessageQueue } from "../background/queue";
 import { postgres } from "../db";
 import { FEDIFY_ORIGIN } from "../env";
-
-// oxlint-disable-next-line typescript/dot-notation
-const nodeType = process.env["NODE_TYPE"] ?? "all";
+import { registerPollNotifications } from "../poll-notification-tasks";
+import { registerRemoteReplyScrapes } from "./replies-tasks";
 
 // oxlint-disable-next-line typescript/dot-notation
 const fedifyDebug = process.env["FEDIFY_DEBUG"] === "true";
@@ -40,11 +42,27 @@ if (fedifyDebug) {
   });
 }
 
+const activityQueue = new ParallelMessageQueue(
+  new PostgresMessageQueue(postgres),
+  10,
+);
+export const taskQueue = new TaskMessageQueue(
+  new PollMessageQueue(postgres, {
+    handlerTimeout: { seconds: 0 },
+  }),
+);
+
 let federation: Federation<void> & { sink?: Sink } = createFederation<void>({
   kv,
-  queue: new ParallelMessageQueue(new PostgresMessageQueue(postgres), 10),
-  // Only start the queue automatically if not running as a web-only node
-  manuallyStartQueue: nodeType === "web",
+  queue: {
+    inbox: activityQueue,
+    outbox: activityQueue,
+    fanout: activityQueue,
+    task: taskQueue,
+  },
+  taskQueueResolution: "strict",
+  // Server startup owns the AbortSignal in every consuming mode.
+  manuallyStartQueue: true,
   // TODO: Revert to Fedify's default RFC 9421-first behavior once
   // https://github.com/bonfire-networks/activity_pub/issues/8 is fixed and
   // released.
@@ -57,6 +75,26 @@ let federation: Federation<void> & { sink?: Sink } = createFederation<void>({
   tracerProvider,
   origin: FEDIFY_ORIGIN,
 });
+
+export const backgroundJobs = registerBackgroundJobs(
+  federation,
+  async () =>
+    (await taskQueue.getDepth()).ready ?? (await taskQueue.getDepth()).queued,
+);
+
+export const replyScrapes = registerRemoteReplyScrapes(
+  federation,
+  async () =>
+    (await taskQueue.getDepth()).ready ?? (await taskQueue.getDepth()).queued,
+);
+backgroundJobs.addRecovery(replyScrapes.recover);
+
+export const pollNotifications = registerPollNotifications(
+  federation,
+  async () =>
+    (await taskQueue.getDepth()).ready ?? (await taskQueue.getDepth()).queued,
+);
+backgroundJobs.addRecovery(pollNotifications.recover);
 
 if (fedifyDebug && exporter != null) {
   federation = createFederationDebugger(federation, { exporter, kv });

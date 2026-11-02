@@ -1,5 +1,16 @@
+import type { InboxContext } from "@fedify/fedify";
+import { Create, Note, Person, PUBLIC_COLLECTION, Update } from "@fedify/vocab";
 import { eq } from "drizzle-orm";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import { cleanDatabase } from "../../../tests/helpers";
 import {
@@ -10,6 +21,8 @@ import {
   getApplication,
 } from "../../../tests/helpers/oauth";
 import db from "../../db";
+import { federation } from "../../federation";
+import { onPostCreated, onPostUpdated } from "../../federation/inbox";
 import app from "../../index";
 import {
   accountOwners,
@@ -27,7 +40,7 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe.sequential("/api/v1/accounts/verify_credentials", () => {
+describe("/api/v1/accounts/verify_credentials", { concurrent: false }, () => {
   let client: Awaited<ReturnType<typeof createOAuthApplication>>;
   let account: Awaited<ReturnType<typeof createAccount>>;
   let application: Awaited<ReturnType<typeof getApplication>>;
@@ -42,6 +55,119 @@ describe.sequential("/api/v1/accounts/verify_credentials", () => {
     });
     application = await getApplication(client);
     accessToken = await getAccessToken(client, account, ["write"]);
+  });
+
+  it("preserves opt-in Markdown across API, federation, and canonical HTML", async () => {
+    vi.stubEnv(
+      "MARKDOWN_EXTENSIONS",
+      "footnote,deflist,sub,sup,mark,ruby,ins,abbr,tasklist,math",
+    );
+    const source =
+      "Note[^n] H~2~O x^2^ ==bright== ++added++ {漢字:한자} HTML $x^2$\n\nTerm\n: Meaning\n\n- [x] Done\n\n*[HTML]: Hypertext Markup Language\n\n[^n]: Detail";
+    const headers = {
+      authorization: bearerAuthorization(accessToken),
+      "Content-Type": "application/json",
+    };
+    const createdResponse = await app.request("/api/v1/statuses", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ status: source }),
+    });
+    expect(createdResponse.status).toBe(200);
+    const created = await createdResponse.json();
+    for (const tag of [
+      "<sub>",
+      "<sup>",
+      "<mark>",
+      "<ins>",
+      "<ruby",
+      "<abbr",
+      "<dl>",
+      "<math",
+    ])
+      expect(created.content).toContain(tag);
+    expect(created.content).toContain("[x] Done");
+    expect(created.content).toContain(`id="fn-hollo-${created.id}-1"`);
+    expect(created.content).toContain(
+      `${created.url}#fn-hollo-${created.id}-1`,
+    );
+    expect(created.card).toBeNull();
+    const stored = await db.query.posts.findFirst({
+      where: { id: created.id },
+    });
+    expect(stored?.contentHtml).toContain("<math");
+    const activityResponse = await federation.fetch(
+      new Request(created.uri, {
+        headers: { Accept: "application/activity+json" },
+      }),
+      { contextData: undefined },
+    );
+    expect(activityResponse.status).toBe(200);
+    expect(JSON.stringify(await activityResponse.json())).toContain(
+      `fn-hollo-${created.id}-1`,
+    );
+    const page = await app.request(new URL(created.url).pathname);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain(`id="fn-hollo-${created.id}-1"`);
+    const profile = await app.request(`/@${created.account.username}`);
+    expect(profile.status).toBe(200);
+    expect(await profile.text()).not.toContain(`id="fn-hollo-${created.id}-1"`);
+    vi.stubEnv("MARKDOWN_EXTENSIONS", "");
+    const unchanged = await app.request(`/api/v1/statuses/${created.id}`);
+    expect((await unchanged.json()).content).toBe(created.content);
+    const edited = await app.request(`/api/v1/statuses/${created.id}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ status: source }),
+    });
+    expect(edited.status).toBe(200);
+    expect((await edited.json()).content).not.toContain("<math");
+    vi.stubEnv("MARKDOWN_EXTENSIONS", "footnote");
+    const restored = await app.request(`/api/v1/statuses/${created.id}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ status: "Updated[^n]\n\n[^n]: Detail" }),
+    });
+    expect((await restored.json()).content).toContain(
+      `${created.url}#fn-hollo-${created.id}-1`,
+    );
+  });
+
+  it("schedules a poll only after its creation commits, even if enqueue fails", async () => {
+    const { pollNotifications } = await import("../../federation/federation");
+    const enqueue = vi
+      .spyOn(pollNotifications, "enqueue")
+      .mockImplementation(async (_ctx, pollId) => {
+        const committed = await db.query.posts.findFirst({
+          where: { pollId: { eq: pollId } },
+        });
+        expect(committed?.accountId).toBe(account.id);
+        throw new Error("queue offline");
+      });
+    try {
+      const response = await app.request("/api/v1/statuses", {
+        method: "POST",
+        headers: {
+          authorization: bearerAuthorization(accessToken),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          status: "Pick one",
+          poll: { options: ["A", "B"], expires_in: 60 },
+        }),
+      });
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(enqueue).toHaveBeenCalledTimes(1);
+      expect(enqueue.mock.calls[0][1]).toBe(result.poll.id);
+      expect(
+        await db.query.polls.findFirst({
+          where: { id: { eq: result.poll.id } },
+        }),
+      ).toBeDefined();
+    } finally {
+      enqueue.mockRestore();
+    }
   });
 
   it("Successfully creates a new status with a valid access token using JSON", async () => {
@@ -128,6 +254,7 @@ describe.sequential("/api/v1/accounts/verify_credentials", () => {
 
   it("uses North Korean readings for an explicit ko-KP language", async () => {
     vi.stubEnv("GUKHANMUN", "ko,ko-*");
+    vi.stubEnv("GUKHANMUN_DICTS", "loanwords,opendict:north-korean,stdict");
 
     const response = await app.request("/api/v1/statuses", {
       method: "POST",
@@ -832,7 +959,19 @@ describe.sequential("/api/v1/accounts/verify_credentials", () => {
   });
 });
 
-describe.sequential("/api/v1/statuses quotes", () => {
+describe("/api/v1/statuses quotes", { concurrent: false }, () => {
+  const queueController = new AbortController();
+  let queue: Promise<void>;
+  beforeAll(() => {
+    // Server startup now owns queue consumption; requests only enqueue.
+    queue = federation.startQueue(undefined, {
+      signal: queueController.signal,
+    });
+  });
+  afterAll(async () => {
+    queueController.abort();
+    await queue;
+  });
   let author: Awaited<ReturnType<typeof createAccount>>;
   let quoter: Awaited<ReturnType<typeof createAccount>>;
   let client: Awaited<ReturnType<typeof createOAuthApplication>>;
@@ -876,6 +1015,118 @@ describe.sequential("/api/v1/statuses quotes", () => {
       body: JSON.stringify(body),
     });
   }
+
+  it("exposes an impolite quote and preserves API revocation through a remote Update", async () => {
+    const targetResponse = await createStatus(authorToken, {
+      status: "Quote this",
+      quote_approval_policy: "public",
+    });
+    const target = await targetResponse.json();
+    const remoteId = uuidv7();
+    const remoteIri = "https://remote.test/users/impolite-quoter";
+    const quoteIri = "https://remote.test/notes/impolite";
+    await db
+      .insert(instances)
+      .values({ host: "remote.test" })
+      .onConflictDoNothing();
+    await db.insert(accounts).values({
+      id: remoteId,
+      iri: remoteIri,
+      instanceHost: "remote.test",
+      type: "Person",
+      name: "Impolite quoter",
+      handle: "@impolite-quoter@remote.test",
+      bioHtml: "",
+      protected: false,
+      inboxUrl: `${remoteIri}/inbox`,
+      published: new Date(),
+    });
+    function note() {
+      return new Note({
+        id: new URL(quoteIri),
+        attribution: new Person({
+          id: new URL(remoteIri),
+          preferredUsername: "impolite-quoter",
+          inbox: new URL(`${remoteIri}/inbox`),
+        }),
+        quoteUrl: new URL(target.uri),
+        to: PUBLIC_COLLECTION,
+        content: "<p>Remote quote</p>",
+      });
+    }
+    const ctx = federation.createContext(
+      new URL("https://hollo.test"),
+      undefined,
+    ) as InboxContext<void>;
+    await onPostCreated(
+      ctx,
+      new Create({ actor: new URL(remoteIri), object: note() }),
+    );
+    const quote = await db.query.posts.findFirst({
+      where: { iri: { eq: quoteIri } },
+    });
+    const quoteResponse = await app.request(`/api/v1/statuses/${quote!.id}`, {
+      headers: { authorization: bearerAuthorization(authorToken) },
+    });
+    expect(quoteResponse.status).toBe(200);
+    expect((await quoteResponse.json()).quote).toMatchObject({
+      state: "accepted",
+      quoted_status: { id: target.id },
+    });
+    const counted = await app.request(`/api/v1/statuses/${target.id}`);
+    expect((await counted.json()).quotes_count).toBe(1);
+    expect(
+      await db.query.notifications.findMany({
+        where: { type: { eq: "quote" }, targetPostId: { eq: quote!.id } },
+      }),
+    ).toHaveLength(1);
+    const authorizationRequest = () =>
+      new Request(quote!.quoteAuthorizationIri!, {
+        headers: { Accept: "application/activity+json" },
+      });
+    expect(
+      (
+        await federation.fetch(authorizationRequest(), {
+          contextData: undefined,
+        })
+      ).status,
+    ).toBe(200);
+
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 202 }));
+    try {
+      const revoked = await app.request(
+        `/api/v1/statuses/${target.id}/quotes/${quote!.id}/revoke`,
+        {
+          method: "POST",
+          headers: { authorization: bearerAuthorization(authorToken) },
+        },
+      );
+      expect(revoked.status).toBe(200);
+      expect((await revoked.json()).quote.state).toBe("revoked");
+      await onPostUpdated(
+        ctx,
+        new Update({ actor: new URL(remoteIri), object: note() }),
+      );
+      const edited = await app.request(`/api/v1/statuses/${quote!.id}`);
+      expect((await edited.json()).quote).toMatchObject({
+        state: "revoked",
+        quoted_status: null,
+      });
+      const countedAgain = await app.request(`/api/v1/statuses/${target.id}`);
+      expect((await countedAgain.json()).quotes_count).toBe(0);
+      expect(
+        (
+          await federation.fetch(authorizationRequest(), {
+            contextData: undefined,
+          })
+        ).status,
+      ).toBe(404);
+    } finally {
+      fetch.mockRestore();
+    }
+  });
 
   it("allows same-instance quotes regardless of quote policy and emits an authorization IRI", async () => {
     expect.assertions(7);
@@ -1806,7 +2057,123 @@ describe.sequential("/api/v1/statuses quotes", () => {
   });
 });
 
-describe.sequential("/api/v1/statuses/:id/reblog", () => {
+describe("DELETE /api/v1/statuses/:id", { concurrent: false }, () => {
+  let client: Awaited<ReturnType<typeof createOAuthApplication>>;
+  let account: Awaited<ReturnType<typeof createAccount>>;
+  let accessToken: Awaited<ReturnType<typeof getAccessToken>>;
+
+  beforeEach(async () => {
+    await cleanDatabase();
+
+    account = await createAccount({ generateKeyPair: true });
+    client = await createOAuthApplication({ scopes: ["write:statuses"] });
+    accessToken = await getAccessToken(client, account, ["write:statuses"]);
+  });
+
+  it("deletes the authenticated account's own status", async () => {
+    const postId = uuidv7();
+    await db.insert(posts).values({
+      id: postId,
+      iri: `https://hollo.test/@hollo/${postId}`,
+      type: "Note",
+      accountId: account.id,
+      visibility: "direct",
+      summary: "Content warning",
+      content: "Secret post",
+      contentHtml: "<p>Secret post</p>",
+      published: new Date(),
+    });
+
+    const response = await app.request(`/api/v1/statuses/${postId}`, {
+      method: "DELETE",
+      headers: { authorization: bearerAuthorization(accessToken) },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      id: postId,
+      account: { id: account.id },
+      content: "<p>Secret post</p>",
+      text: "Secret post",
+      spoiler_text: "Content warning",
+    });
+    expect(
+      await db.query.posts.findFirst({ where: { id: { eq: postId } } }),
+    ).toBeUndefined();
+  });
+
+  it("does not delete another local account's status", async () => {
+    const otherAccount = await createAccount({ username: "other" });
+    const postId = uuidv7();
+    await db.insert(posts).values({
+      id: postId,
+      iri: `https://hollo.test/@other/${postId}`,
+      type: "Note",
+      accountId: otherAccount.id,
+      visibility: "private",
+      summary: "Private content warning",
+      content: "Private post",
+      contentHtml: "<p>Private post</p>",
+      published: new Date(),
+    });
+
+    const response = await app.request(`/api/v1/statuses/${postId}`, {
+      method: "DELETE",
+      headers: { authorization: bearerAuthorization(accessToken) },
+    });
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "Record not found" });
+    expect(
+      await db.query.posts.findFirst({ where: { id: { eq: postId } } }),
+    ).toMatchObject({
+      accountId: otherAccount.id,
+      summary: "Private content warning",
+      content: "Private post",
+    });
+  });
+
+  it("does not delete a cached remote status", async () => {
+    const remoteAccountId = uuidv7();
+    await db.insert(instances).values({ host: "remote.test" });
+    await db.insert(accounts).values({
+      id: remoteAccountId,
+      iri: "https://remote.test/users/remote",
+      instanceHost: "remote.test",
+      type: "Person",
+      name: "Remote",
+      handle: "@remote@remote.test",
+      inboxUrl: "https://remote.test/users/remote/inbox",
+    });
+    const postId = uuidv7();
+    await db.insert(posts).values({
+      id: postId,
+      iri: `https://remote.test/users/remote/statuses/${postId}`,
+      type: "Note",
+      accountId: remoteAccountId,
+      visibility: "public",
+      content: "Remote post",
+      contentHtml: "<p>Remote post</p>",
+      published: new Date(),
+    });
+
+    const response = await app.request(`/api/v1/statuses/${postId}`, {
+      method: "DELETE",
+      headers: { authorization: bearerAuthorization(accessToken) },
+    });
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: "Record not found" });
+    expect(
+      await db.query.posts.findFirst({ where: { id: { eq: postId } } }),
+    ).toMatchObject({
+      accountId: remoteAccountId,
+      content: "Remote post",
+    });
+  });
+});
+
+describe("/api/v1/statuses/:id/reblog", { concurrent: false }, () => {
   let client: Awaited<ReturnType<typeof createOAuthApplication>>;
   let account: Awaited<ReturnType<typeof createAccount>>;
   let accessToken: Awaited<ReturnType<typeof getAccessToken>>;
@@ -1914,7 +2281,7 @@ describe.sequential("/api/v1/statuses/:id/reblog", () => {
   });
 });
 
-describe.sequential("/api/v1/statuses visibility", () => {
+describe("/api/v1/statuses visibility", { concurrent: false }, () => {
   let viewer: Awaited<ReturnType<typeof createAccount>>;
   let approvedAuthor: Awaited<ReturnType<typeof createAccount>>;
   let pendingAuthor: Awaited<ReturnType<typeof createAccount>>;
@@ -2049,5 +2416,141 @@ describe.sequential("/api/v1/statuses visibility", () => {
     expect(json.ancestors).toHaveLength(1);
     expect(json.ancestors[0].id).toBe(ancestorPostId);
     expect(json.descendants).toHaveLength(0);
+  });
+});
+
+describe("/api/v1/statuses Article titles", { concurrent: false }, () => {
+  let account: Awaited<ReturnType<typeof createAccount>>;
+  let accessToken: Awaited<ReturnType<typeof getAccessToken>>;
+  let remoteAuthorId: ReturnType<typeof uuidv7>;
+
+  beforeEach(async () => {
+    await cleanDatabase();
+
+    account = await createAccount({ generateKeyPair: true });
+    const client = await createOAuthApplication({
+      scopes: ["read:statuses"],
+    });
+    accessToken = await getAccessToken(client, account, ["read:statuses"]);
+    remoteAuthorId = uuidv7();
+    await db.insert(instances).values({ host: "remote.test" });
+    await db.insert(accounts).values({
+      id: remoteAuthorId,
+      iri: "https://remote.test/@blogger",
+      type: "Person",
+      name: "Blogger",
+      handle: "@blogger@remote.test",
+      bioHtml: "",
+      protected: false,
+      inboxUrl: "https://remote.test/@blogger/inbox",
+      sharedInboxUrl: "https://remote.test/inbox",
+      instanceHost: "remote.test",
+    });
+  });
+
+  async function insertArticle(name: string) {
+    const id = uuidv7();
+    await db.insert(posts).values({
+      id,
+      iri: `https://remote.test/@blogger/articles/${id}`,
+      type: "Article",
+      accountId: remoteAuthorId,
+      visibility: "public",
+      name,
+      content: "Body",
+      contentHtml: "<p>Body</p>",
+      published: new Date(),
+    });
+    return id;
+  }
+
+  async function getStatus(id: string) {
+    const response = await app.request(`/api/v1/statuses/${id}`, {
+      headers: { authorization: bearerAuthorization(accessToken) },
+    });
+    expect(response.status).toBe(200);
+    return await response.json();
+  }
+
+  it("prepends the escaped title as a heading", async () => {
+    expect.assertions(4);
+    const id = await insertArticle("Why I left");
+    const html = await insertArticle("<script>alert(1)</script> & co");
+
+    expect((await getStatus(id)).content).toBe(
+      "<h2>Why I left</h2><p>Body</p>",
+    );
+    expect((await getStatus(html)).content).toBe(
+      "<h2>&lt;script&gt;alert(1)&lt;/script&gt; &amp; co</h2><p>Body</p>",
+    );
+  });
+
+  it("keeps an entity-looking title verbatim", async () => {
+    expect.assertions(2);
+    const id = await insertArticle("&lt;script&gt;");
+
+    expect((await getStatus(id)).content).toBe(
+      "<h2>&amp;lt;script&amp;gt;</h2><p>Body</p>",
+    );
+  });
+
+  it("includes the title in a reblogged status", async () => {
+    expect.assertions(2);
+    const articleId = await insertArticle("Shared title");
+    const shareId = uuidv7();
+    await db.insert(posts).values({
+      id: shareId,
+      iri: `https://hollo.test/@hollo/${shareId}`,
+      type: "Article",
+      accountId: account.id,
+      sharingId: articleId,
+      visibility: "public",
+      published: new Date(),
+    });
+
+    const json = await getStatus(shareId);
+
+    expect(json.reblog.content).toBe("<h2>Shared title</h2><p>Body</p>");
+  });
+
+  it("includes the title in an accepted quote but not in a pending one", async () => {
+    expect.assertions(5);
+    const articleId = await insertArticle("Quoted title");
+    const acceptedId = uuidv7();
+    const pendingId = uuidv7();
+    await db.insert(posts).values([
+      {
+        id: acceptedId,
+        iri: `https://hollo.test/@hollo/${acceptedId}`,
+        type: "Note",
+        accountId: account.id,
+        visibility: "public",
+        content: "Accepted",
+        contentHtml: "<p>Accepted</p>",
+        quoteTargetId: articleId,
+        quoteState: "accepted",
+        published: new Date(),
+      },
+      {
+        id: pendingId,
+        iri: `https://hollo.test/@hollo/${pendingId}`,
+        type: "Note",
+        accountId: account.id,
+        visibility: "public",
+        content: "Pending",
+        contentHtml: "<p>Pending</p>",
+        quoteTargetId: articleId,
+        quoteState: "pending",
+        published: new Date(),
+      },
+    ]);
+
+    const accepted = await getStatus(acceptedId);
+    expect(accepted.quote.quoted_status.content).toBe(
+      "<h2>Quoted title</h2><p>Body</p>",
+    );
+    const pending = await getStatus(pendingId);
+    expect(pending.quote.quoted_status).toBeNull();
+    expect(JSON.stringify(pending)).not.toContain("Quoted title");
   });
 });

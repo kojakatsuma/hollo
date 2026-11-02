@@ -1,11 +1,10 @@
 import { isIP } from "node:net";
 
-import { serve } from "@hono/node-server";
-import { behindProxy } from "x-forwarded-fetch";
-
 import "../src/logging";
 import { checkHandleHostConsistency } from "../src/handle-host-check";
+import { getMarkdownExtensions } from "../src/markdown-settings";
 import { configureSentry } from "../src/sentry";
+import { createServerLifecycle } from "../src/server-lifecycle";
 
 // oxlint-disable-next-line typescript/dot-notation
 configureSentry(process.env["SENTRY_DSN"]);
@@ -41,85 +40,111 @@ if (!["all", "web", "worker"].includes(NODE_TYPE)) {
   process.exit(1);
 }
 
-// Warn if the configured HANDLE_HOST disagrees with an existing account.
-await checkHandleHostConsistency();
+getMarkdownExtensions();
 
-// Start web server if running as web or all node
-if (NODE_TYPE === "web" || NODE_TYPE === "all") {
-  const { default: app } = await import("../src/index");
-  serve(
-    {
-      fetch: BEHIND_PROXY
-        ? behindProxy(app.fetch.bind(app))
-        : app.fetch.bind(app),
+const lifecycle = createServerLifecycle([
+  async () => {
+    // Warn if HANDLE_HOST disagrees with an existing account.
+    await checkHandleHostConsistency();
+  },
+  async (registerStop) => {
+    if (NODE_TYPE === "worker") return;
+    // Initialize Sentry before loading the HTTP adapter and application.
+    const { createHttpServer, enableFastResponse } =
+      await import("../src/http-server");
+    enableFastResponse();
+    const { default: app } = await import("../src/index");
+    if (lifecycle.stopping) return;
+    const server = createHttpServer(app.fetch.bind(app), {
       port: PORT,
       hostname: BIND,
-    },
-    (info) => {
-      let host = info.address;
-      // We override it here to show localhost instead of what it resolves to:
-      if (BIND === "localhost") {
-        host = "localhost";
-      } else if (info.family === "IPv6") {
-        host = `[${info.address}]`;
-      }
-
-      console.log(`Listening on http://${host}:${info.port}/`);
-    },
-  );
-}
-
-// Start workers if running as worker or all node
-let stopWorkers: (() => void) | undefined;
-if (NODE_TYPE === "worker" || NODE_TYPE === "all") {
-  const [
-    { federation },
-    { startImportWorker, stopImportWorker },
-    { startCleanupWorker, stopCleanupWorker },
-    { startRemoteReplyScrapeWorker, stopRemoteReplyScrapeWorker },
-    { startPollNotificationWorker, stopPollNotificationWorker },
-  ] = await Promise.all([
-    import("../src/federation"),
-    import("../src/import/worker"),
-    import("../src/cleanup/worker"),
-    import("../src/federation/replies-worker"),
-    import("../src/poll-notification-worker"),
-  ]);
-  stopWorkers = () => {
-    stopImportWorker();
-    stopCleanupWorker();
-    stopRemoteReplyScrapeWorker();
-    stopPollNotificationWorker();
-  };
-
-  // Start the Fedify message queue
-  const controller = new AbortController();
-  federation
-    .startQueue(undefined, { signal: controller.signal })
-    .catch((error) => {
-      console.error("Error starting Fedify queue:", error);
-      process.exit(1);
+      behindProxy: BEHIND_PROXY,
     });
+    registerStop(() => server.close());
+    await server.ready();
+    if (lifecycle.stopping) return;
+    const url = new URL(server.url!);
+    if (BIND === "localhost") url.hostname = "localhost";
+    console.log(`Listening on ${url.href}`);
+  },
+  async (registerStop) => {
+    if (NODE_TYPE === "web") return;
+    const [
+      { federation },
+      { backgroundJobs, replyScrapes, pollNotifications },
+      { itemLeases },
+      { WEB_ORIGIN },
+    ] = await Promise.all([
+      import("../src/federation"),
+      import("../src/federation/federation"),
+      import("../src/background/lease"),
+      import("../src/env"),
+    ]);
+    if (lifecycle.stopping) return;
 
-  // Start the workers for background job processing
-  startImportWorker();
-  startCleanupWorker();
-  startRemoteReplyScrapeWorker();
-  startPollNotificationWorker();
+    const controller = new AbortController();
+    let queue: Promise<void> | undefined;
+    let stopRecovery: (() => Promise<void>) | undefined;
+    // Publish cleanup before any fallible worker initialization.
+    registerStop(async () => {
+      controller.abort();
+      try {
+        await stopRecovery?.();
+        await queue;
+      } finally {
+        await itemLeases.close();
+      }
+    });
+    backgroundJobs.setSignal(controller.signal);
+    replyScrapes.setSignal(controller.signal);
+    pollNotifications.setSignal(controller.signal);
+    queue = federation
+      .startQueue(undefined, { signal: controller.signal })
+      .catch((error) => {
+        console.error("Error starting Fedify queue:", error);
+        void shutdown(1);
+      });
+    stopRecovery = backgroundJobs.startRecovery(
+      federation.createContext(
+        new URL(WEB_ORIGIN ?? "http://localhost"),
+        undefined,
+      ),
+      controller.signal,
+    );
+    console.log("Worker started (Fedify activity/task queues + Job recovery)");
+  },
+]);
 
-  console.log(
-    "Worker started (Fedify queue + Import worker + Cleanup worker + Remote reply scrape worker + Poll notification worker)",
+let exitCode = 0;
+let shutdownPromise: Promise<void> | undefined;
+/** Stop acquired resources once, forcing exit if cleanup exceeds 30 seconds. */
+function shutdown(code = 0): Promise<void> {
+  exitCode = Math.max(exitCode, code);
+  if (shutdownPromise) return shutdownPromise;
+  // Forced termination releases DB locks; durable unfinished items recover on
+  // restart. Do not reuse a slot while its external operation is still alive.
+  const deadline = setTimeout(() => process.exit(exitCode), 30_000);
+  deadline.unref();
+  shutdownPromise = lifecycle.stop().then(
+    () => {
+      // The legacy federation queue does not drain its handlers. Keep the main
+      // client available until process exit rather than rejecting their queries.
+      process.exit(exitCode);
+    },
+    (error) => {
+      console.error("Error stopping server:", error);
+      process.exit(1);
+    },
   );
+  return shutdownPromise;
 }
 
-// Graceful shutdown handling
-const shutdown = () => {
-  if (NODE_TYPE === "worker" || NODE_TYPE === "all") {
-    console.log("Stopping workers...");
-    stopWorkers?.();
-  }
-  process.exit(0);
-};
-
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+// Handle signals even during asynchronous startup.
+process.on("SIGTERM", () => void shutdown());
+process.on("SIGINT", () => void shutdown());
+try {
+  await lifecycle.start();
+} catch (error) {
+  console.error("Error starting server:", error);
+  await shutdown(1);
+}

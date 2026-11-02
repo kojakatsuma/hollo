@@ -252,6 +252,13 @@ HTML, no visible card border.  A subtle bottom divider separates each
 entry in a list.  Avatar, display name, handle, timestamp, and content
 stack vertically on mobile and arrange into a media object on `md`.
 
+A post with a title (an incoming ActivityPub `Article`) shows it as a
+heading above the body, inside the content warning disclosure if there is
+one: `text-lg font-semibold leading-snug` in neutral ink, stepping up to
+`text-xl` on a featured post.  The heading is an `<h2>` on a featured
+post's own page and an `<h3>` in lists, following the one-level-per-depth
+rule.
+
 ### Avatar
 
 Always circular.  Sizes: *sm* 1.5 rem, *md* 2.5 rem, *lg* 4 rem,
@@ -390,3 +397,15 @@ public login page — prefer the passkey pattern over an inline blob:
     should be hidden behind a button the user has to click).
  -  Wire to the DOM via stable `id`s on the form / button the page
     already renders.  The server-rendered markup is the contract.
+
+
+Markdown extensions
+-------------------
+
+Post bodies use native semantic HTML for optional Markdown extensions.
+Footnotes include visible numbers in their text; suppress duplicate list
+numbering in Hollo.  Retain their generated IDs only in the canonical post
+body, so repeated cards link back to that document without duplicate IDs.
+Task lists use static text markers.  Highlight text uses the account theme
+palette in both color schemes.  Display math may scroll horizontally within
+the post body; no client-side typesetting or KaTeX stylesheet is required.

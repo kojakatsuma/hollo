@@ -511,6 +511,7 @@ export const posts = pgTable(
       "quote_approval_policy",
     ).default("public"),
     visibility: postVisibilityEnum("visibility").notNull(),
+    name: text("name"),
     summary: text("summary"),
     contentHtml: text("content_html"),
     content: text("content"),
@@ -1029,6 +1030,7 @@ export const notifications = pgTable(
     readAt: timestamp("read_at", { withTimezone: true }),
   },
   (table) => [
+    index().on(table.targetPostId),
     index().on(table.accountOwnerId, table.created),
     index().on(table.accountOwnerId, table.readAt),
     index().on(table.groupKey),
@@ -1076,6 +1078,7 @@ export const notificationGroups = pgTable(
       .default(currentTimestamp),
   },
   (table) => [
+    index().on(table.targetPostId),
     index().on(table.accountOwnerId, table.updated),
     index().on(table.accountOwnerId, table.type),
   ],
@@ -1097,6 +1100,7 @@ export const timelinePosts = pgTable(
       .references(() => posts.id, { onDelete: "cascade" }),
   },
   (table) => [
+    index().on(table.postId),
     primaryKey({ columns: [table.accountId, table.postId] }),
     index().on(table.accountId, table.postId),
   ],
@@ -1118,6 +1122,7 @@ export const listPosts = pgTable(
       .references(() => posts.id, { onDelete: "cascade" }),
   },
   (table) => [
+    index().on(table.postId),
     primaryKey({ columns: [table.listId, table.postId] }),
     index().on(table.listId, table.postId),
   ],
@@ -1170,10 +1175,16 @@ export const importJobs = pgTable(
       .default(currentTimestamp),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    nextDispatchAt: timestamp("next_dispatch_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
   },
   (table) => [
     index().on(table.accountOwnerId, table.status),
     index().on(table.status, table.created),
+    index()
+      .on(table.nextDispatchAt)
+      .where(sql`${table.status} IN ('pending', 'processing')`),
   ],
 );
 
@@ -1193,11 +1204,43 @@ export const importJobItems = pgTable(
     data: jsonb("data").notNull().$type<Record<string, unknown>>(),
     errorMessage: text("error_message"),
     processedAt: timestamp("processed_at", { withTimezone: true }),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
+    nextDispatchAt: timestamp("next_dispatch_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
     created: timestamp("created", { withTimezone: true })
       .notNull()
       .default(currentTimestamp),
   },
-  (table) => [index().on(table.jobId, table.status)],
+  (table) => [
+    index().on(table.jobId, table.status),
+    index()
+      .on(table.jobId, table.nextDispatchAt)
+      .where(sql`${table.status} IN ('pending', 'processing')`),
+  ],
+);
+
+export const importJobEffects = pgTable(
+  "import_job_effects",
+  {
+    itemId: uuid("item_id")
+      .$type<Uuid>()
+      .primaryKey()
+      .references(() => importJobItems.id, { onDelete: "cascade" }),
+    deliveries: jsonb("deliveries")
+      .notNull()
+      .$type<import("./import/delivery").ImportDelivery[]>()
+      .default([]),
+    delivered: integer("delivered").notNull().default(0),
+  },
+  (table) => [
+    index()
+      .on(table.itemId)
+      .where(sql`${table.delivered} < jsonb_array_length(${table.deliveries})`),
+  ],
 );
 
 export type ImportJobItem = typeof importJobItems.$inferSelect;
@@ -1241,8 +1284,16 @@ export const cleanupJobs = pgTable(
       .default(currentTimestamp),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    nextDispatchAt: timestamp("next_dispatch_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
   },
-  (table) => [index().on(table.status, table.created)],
+  (table) => [
+    index().on(table.status, table.created),
+    index()
+      .on(table.nextDispatchAt)
+      .where(sql`${table.status} IN ('pending', 'processing')`),
+  ],
 );
 
 export type CleanupJob = typeof cleanupJobs.$inferSelect;
@@ -1261,11 +1312,26 @@ export const cleanupJobItems = pgTable(
     data: jsonb("data").notNull().$type<Record<string, unknown>>(),
     errorMessage: text("error_message"),
     processedAt: timestamp("processed_at", { withTimezone: true }),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
+    nextDispatchAt: timestamp("next_dispatch_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
     created: timestamp("created", { withTimezone: true })
       .notNull()
       .default(currentTimestamp),
   },
-  (table) => [index().on(table.jobId, table.status)],
+  (table) => [
+    index().on(table.jobId, table.status),
+    index()
+      .on(table.jobId, table.nextDispatchAt)
+      .where(sql`${table.status} IN ('pending', 'processing')`),
+    index("cleanup_job_items_proxy_key_index")
+      .on(table.jobId, sql`(${table.data}->>'key')`)
+      .where(sql`${table.data}->>'kind' = 'proxy_cache'`),
+  ],
 );
 
 export type CleanupJobItem = typeof cleanupJobItems.$inferSelect;
@@ -1275,11 +1341,16 @@ export type NewCleanupJobItem = typeof cleanupJobItems.$inferInsert;
 
 export const remoteReplyScrapeJobStatusEnum = pgEnum(
   "remote_reply_scrape_job_status",
-  ["pending", "processing", "completed", "failed"],
+  ["pending", "processing", "completed", "failed", "waiting"],
 );
 
 export type RemoteReplyScrapeJobStatus =
   (typeof remoteReplyScrapeJobStatusEnum.enumValues)[number];
+
+export const remoteReplyScrapeKindEnum = pgEnum("remote_reply_scrape_kind", [
+  "replies",
+  "context",
+]);
 
 export const remoteReplyScrapeJobs = pgTable(
   "remote_reply_scrape_jobs",
@@ -1290,7 +1361,19 @@ export const remoteReplyScrapeJobs = pgTable(
       .notNull()
       .references(() => posts.id, { onDelete: "cascade" }),
     postIri: text("post_iri").notNull(),
-    repliesIri: text("replies_iri").notNull().unique(),
+    // The legacy column also holds the collection target of context jobs.
+    repliesIri: text("replies_iri").notNull(),
+    kind: remoteReplyScrapeKindEnum("kind").notNull().default("replies"),
+    blockedByJobId: uuid("blocked_by_job_id")
+      .$type<Uuid>()
+      .references((): AnyPgColumn => remoteReplyScrapeJobs.id, {
+        onDelete: "set null",
+      }),
+    partial: boolean("partial").notNull().default(false),
+    yieldedItems: integer("yielded_items").notNull().default(0),
+    requestCount: integer("request_count").notNull().default(0),
+    skippedItems: integer("skipped_items").notNull().default(0),
+    hostRequeues: integer("host_requeues").notNull().default(0),
     baseUrl: text("base_url").notNull(),
     originHost: text("origin_host").notNull(),
     depth: integer("depth").notNull().default(0),
@@ -1300,6 +1383,9 @@ export const remoteReplyScrapeJobs = pgTable(
     attempts: integer("attempts").notNull().default(0),
     fetchedItems: integer("fetched_items").notNull().default(0),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
+      .notNull()
+      .default(currentTimestamp),
+    nextDispatchAt: timestamp("next_dispatch_at", { withTimezone: true })
       .notNull()
       .default(currentTimestamp),
     errorMessage: text("error_message"),
@@ -1313,6 +1399,15 @@ export const remoteReplyScrapeJobs = pgTable(
       .default(currentTimestamp),
   },
   (table) => [
+    uniqueIndex("remote_reply_scrape_jobs_kind_collection_unique").on(
+      table.kind,
+      table.repliesIri,
+    ),
+    index().on(table.blockedByJobId),
+    index().on(table.postId),
+    index("remote_reply_scrape_jobs_dispatch_index")
+      .on(table.status, table.nextDispatchAt, table.id)
+      .where(sql`${table.status} IN ('pending', 'processing')`),
     index("remote_reply_scrape_jobs_claim_index").on(
       table.status,
       table.nextAttemptAt,
@@ -1334,6 +1429,18 @@ export const remoteReplyScrapeJobs = pgTable(
 export type RemoteReplyScrapeJob = typeof remoteReplyScrapeJobs.$inferSelect;
 export type NewRemoteReplyScrapeJob = typeof remoteReplyScrapeJobs.$inferInsert;
 
+export const remoteContextScrapeAliases = pgTable(
+  "remote_context_scrape_aliases",
+  {
+    iri: text("iri").primaryKey(),
+    jobId: uuid("job_id")
+      .$type<Uuid>()
+      .notNull()
+      .references(() => remoteReplyScrapeJobs.id, { onDelete: "cascade" }),
+  },
+  (table) => [index().on(table.jobId)],
+);
+
 export const remoteReplyScrapeOrigins = pgTable(
   "remote_reply_scrape_origins",
   {
@@ -1342,6 +1449,9 @@ export const remoteReplyScrapeOrigins = pgTable(
       .notNull()
       .default(currentTimestamp),
     lastRequestAt: timestamp("last_request_at", { withTimezone: true }),
+    cooldownUntil: timestamp("cooldown_until", { withTimezone: true })
+      .notNull()
+      .default(sql`'epoch'::timestamptz`),
     processingJobId: uuid("processing_job_id").$type<Uuid>(),
     processingStartedAt: timestamp("processing_started_at", {
       withTimezone: true,
