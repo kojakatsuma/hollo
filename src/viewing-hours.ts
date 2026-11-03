@@ -15,7 +15,7 @@ export interface ViewingHours {
   readonly timeZone: string;
 }
 
-export const DEFAULT_VIEWING_HOURS = "12:00-14:00";
+export const DEFAULT_VIEWING_HOURS = "12:00-15:00";
 export const DEFAULT_VIEWING_HOURS_TIME_ZONE = "Asia/Tokyo";
 
 const RANGE_PATTERN = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/;
